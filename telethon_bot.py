@@ -37,6 +37,7 @@ from aiohttp import web
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import DocumentAttributeVideo
+from telethon.errors import FloodWaitError
 import yt_dlp
 
 logging.basicConfig(
@@ -157,6 +158,17 @@ def friendly_error_message(raw_error: str) -> str:
     return f"❌ تعذّر التحميل لسبب غير معروف. (تفاصيل مختصرة: {raw_error[:150]})"
 
 
+async def safe_edit(status_msg, text: str):
+    """يعدّل رسالة الحالة، ويتجاهل أخطاء FloodWaitError (تيلجرام يحد
+    عدد التعديلات المسموحة بفترة قصيرة) بدل ما يفشل العملية كلها."""
+    try:
+        await status_msg.edit(text)
+    except FloodWaitError as e:
+        logger.warning(f"FloodWaitError عند تعديل الرسالة - تجاهلناها ({e.seconds}s)")
+    except Exception:
+        logger.exception("خطأ غير متوقع أثناء تعديل الرسالة")
+
+
 @client.on(events.NewMessage(outgoing=True, chats="me"))
 async def handle_message(event):
     """يستمع فقط لرسائلك أنت في محادثة Saved Messages.
@@ -200,19 +212,20 @@ async def process_single_url(event, url: str, quality: int | None = None):
                     return
 
                 now = time.monotonic()
-                # تحديث كل 5% تقدّم أو كل 4 ثوانٍ - عشان ما نتجاوز حد
-                # تيلجرام لتعديل الرسائل المتكرر (Flood limit)
-                if (percent - progress_state["last_percent"] >= 5
-                        or now - progress_state["last_edit_time"] >= 4):
+                # تحديث كل 15% تقدّم أو كل 8 ثوانٍ كحد أدنى - تيلجرام
+                # يحد عدد تعديلات الرسالة المسموحة خلال فترة قصيرة
+                # (FloodWaitError)، فنكون متحفظين أكثر لتجنب هذا الحظر.
+                if (percent - progress_state["last_percent"] >= 15
+                        or now - progress_state["last_edit_time"] >= 8):
                     progress_state["last_percent"] = percent
                     progress_state["last_edit_time"] = now
                     new_text = f"⏳ جاري التحميل... {percent:.0f}%\n{url}"
                     asyncio.run_coroutine_threadsafe(
-                        status.edit(new_text), loop
+                        safe_edit(status, new_text), loop
                     )
             elif d.get("status") == "finished":
                 asyncio.run_coroutine_threadsafe(
-                    status.edit(f"✅ اكتمل التحميل، جاري المعالجة...\n{url}"),
+                    safe_edit(status, f"✅ اكتمل التحميل، جاري المعالجة...\n{url}"),
                     loop,
                 )
         except Exception:
@@ -263,12 +276,13 @@ async def process_single_url(event, url: str, quality: int | None = None):
 
         file_size = os.path.getsize(filename)
         if file_size > MAX_FILE_SIZE:
-            await status.edit(
+            await safe_edit(
+                status,
                 f"⚠️ الملف أكبر من {MAX_FILE_SIZE // (1024*1024)} ميجا، تعذر إرساله.\n{url}"
             )
             return
 
-        await status.edit(f"📤 جاري الإرسال...\n{url}")
+        await safe_edit(status, f"📤 جاري الإرسال...\n{url}")
 
         duration, width, height, thumb_path = get_video_metadata(filename)
         attributes = None
@@ -290,13 +304,16 @@ async def process_single_url(event, url: str, quality: int | None = None):
             attributes=attributes,
             thumb=thumb_path,
         )
-        await status.delete()
+        try:
+            await status.delete()
+        except FloodWaitError:
+            pass
 
     except yt_dlp.utils.DownloadError as e:
-        await status.edit(f"{friendly_error_message(str(e))}\n{url}")
+        await safe_edit(status, f"{friendly_error_message(str(e))}\n{url}")
     except Exception as e:
         logger.exception("خطأ غير متوقع")
-        await status.edit(f"❌ حدث خطأ غير متوقع: {str(e)[:150]}\n{url}")
+        await safe_edit(status, f"❌ حدث خطأ غير متوقع: {str(e)[:150]}\n{url}")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
