@@ -58,12 +58,17 @@ async def handle_message(event):
 
     ydl_opts = {
         "outtmpl": output_template,
-        "format": "bestvideo+bestaudio/best",
-        "merge_output_format": "mp4",
+        # نفضّل صيغة MP4 مباشرة (غير مجزّأة) لو متوفرة - أسرع بكثير لأنها
+        # ملف واحد جاهز بدون قطع. لو غير متوفرة (أغلب فيديوهات X الطويلة)
+        # نرجع لأفضل جودة حتى لو كانت مجزأة (HLS).
+        "format": "best[protocol!*=m3u8][ext=mp4]/best[protocol!*=m3u8]/best[ext=mp4]/best",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "max_filesize": MAX_FILE_SIZE,
+        # تحميل عدة أجزاء بالتوازي بدل التسلسل - يسرّع الفيديوهات
+        # المجزأة (HLS) بشكل كبير جدًا لأنها عملية شبكة وليست معالجة.
+        "concurrent_fragment_downloads": 8,
     }
 
     try:
