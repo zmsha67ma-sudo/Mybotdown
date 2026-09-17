@@ -69,7 +69,13 @@ if COOKIES_B64:
         logging.getLogger(__name__).exception("فشل فك ترميز الكوكيز - سيتم التجاهل")
         COOKIES_FILE_PATH = None
 
-client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+client = TelegramClient(
+    StringSession(SESSION_STRING), API_ID, API_HASH,
+    # نمنع Telethon من النوم تلقائيًا عند استقبال FloodWaitError (سلوكه
+    # الافتراضي لو المدة أقل من 60 ثانية) - بدلها نخلي الخطأ يوصل لكودنا
+    # فورًا عشان نتجاهله بأنفسنا عبر safe_edit بدون أي تأخير حقيقي.
+    flood_sleep_threshold=0,
+)
 
 
 def get_video_metadata(filepath: str):
@@ -212,11 +218,10 @@ async def process_single_url(event, url: str, quality: int | None = None):
                     return
 
                 now = time.monotonic()
-                # تحديث كل 15% تقدّم أو كل 8 ثوانٍ كحد أدنى - تيلجرام
-                # يحد عدد تعديلات الرسالة المسموحة خلال فترة قصيرة
-                # (FloodWaitError)، فنكون متحفظين أكثر لتجنب هذا الحظر.
-                if (percent - progress_state["last_percent"] >= 15
-                        or now - progress_state["last_edit_time"] >= 8):
+                # تحديث كل 25% تقدّم أو كل 15 ثانية كحد أدنى - متحفظين
+                # جدًا لتجنب أي احتكاك مع حد تيلجرام لتعديل الرسائل
+                if (percent - progress_state["last_percent"] >= 25
+                        or now - progress_state["last_edit_time"] >= 15):
                     progress_state["last_percent"] = percent
                     progress_state["last_edit_time"] = now
                     new_text = f"⏳ جاري التحميل... {percent:.0f}%\n{url}"
@@ -225,7 +230,7 @@ async def process_single_url(event, url: str, quality: int | None = None):
                     )
             elif d.get("status") == "finished":
                 asyncio.run_coroutine_threadsafe(
-                    safe_edit(status, f"✅ اكتمل التحميل، جاري المعالجة...\n{url}"),
+                    safe_edit(status, f"✅ التحميل 100% - جاري التجهيز...\n{url}"),
                     loop,
                 )
         except Exception:
@@ -282,7 +287,7 @@ async def process_single_url(event, url: str, quality: int | None = None):
             )
             return
 
-        await safe_edit(status, f"📤 جاري الإرسال...\n{url}")
+        await safe_edit(status, f"📤 جاري الإرسال... 0%\n{url}")
 
         duration, width, height, thumb_path = get_video_metadata(filename)
         attributes = None
@@ -296,6 +301,27 @@ async def process_single_url(event, url: str, quality: int | None = None):
                 )
             ]
 
+        upload_state = {"last_percent": -100, "last_edit_time": 0.0}
+
+        def upload_progress(current: int, total: int):
+            """يشتغل داخل asyncio (Telethon يستدعيها مباشرة أثناء الرفع)،
+            نجدول تعديل الرسالة بدون ما نوقف الرفع نفسه."""
+            try:
+                if total <= 0:
+                    return
+                percent = current / total * 100
+                now = time.monotonic()
+                if (percent - upload_state["last_percent"] >= 25
+                        or now - upload_state["last_edit_time"] >= 15
+                        or percent >= 100):
+                    upload_state["last_percent"] = percent
+                    upload_state["last_edit_time"] = now
+                    asyncio.ensure_future(
+                        safe_edit(status, f"📤 جاري الإرسال... {percent:.0f}%\n{url}")
+                    )
+            except Exception:
+                logger.exception("خطأ داخل upload_progress")
+
         await client.send_file(
             "me",
             filename,
@@ -303,6 +329,7 @@ async def process_single_url(event, url: str, quality: int | None = None):
             supports_streaming=True,
             attributes=attributes,
             thumb=thumb_path,
+            progress_callback=upload_progress,
         )
         try:
             await status.delete()
