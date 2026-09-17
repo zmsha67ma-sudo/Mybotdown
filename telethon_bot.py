@@ -5,24 +5,38 @@
 طريقة الاستخدام بعد التشغيل:
 - افتح محادثة "Saved Messages" (رسائلي المحفوظة) في تيلجرام.
 - أرسل رابط فيديو من X أو أي موقع مدعوم.
-- البوت يحمّله ويرسله لك بأعلى جودة ممكنة ضمن حد 2 جيجا.
+- البوت يحمّله ويرسله لك بأعلى جودة متوفرة بالموقع ضمن حد 2 جيجا.
+- لو تبي جودة محددة، أضف الرقم بعد الرابط بنفس الرسالة، مثال:
+  https://x.com/xxx/status/123 720
+  (الأرقام المدعومة: 240, 360, 480, 720, 1080, 1440, 2160)
+  لو ما حددت رقم، يحمّل أعلى جودة موجودة تلقائيًا.
 
 متغيرات البيئة المطلوبة:
 - API_ID, API_HASH: من https://my.telegram.org
 - SESSION_STRING: تحصل عليه من تشغيل generate_session.py على جهازك أولاً
 - PORT: يوفره Render تلقائيًا (لخادم فحص الصحة فقط)
+
+متغير بيئة اختياري (لتحميل فيديوهات تتطلب تسجيل دخول، مثل المحتوى
+المقيد بعمر):
+- COOKIES_B64: محتوى ملف cookies.txt مُرمّز بصيغة Base64 (راجع README
+  لطريقة تصديره من المتصفح وترميزه)
 """
 
 import asyncio
+import base64
+import json
 import logging
 import os
 import re
 import shutil
+import subprocess
 import tempfile
+import time
 
 from aiohttp import web
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.tl.types import DocumentAttributeVideo
 import yt_dlp
 
 logging.basicConfig(
@@ -35,33 +49,192 @@ API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 SESSION_STRING = os.environ.get("SESSION_STRING", "")
 PORT = int(os.environ.get("PORT", "10000"))
+COOKIES_B64 = os.environ.get("COOKIES_B64", "")
 
 MAX_FILE_SIZE = 2000 * 1024 * 1024  # 2 جيجا
 URL_REGEX = re.compile(r"https?://\S+")
+QUALITY_REGEX = re.compile(r"\b(240|360|480|720|1080|1440|2160)\b")
+
+# لو مزوّد كوكيز، نفك ترميزها ونكتبها بملف عشان yt-dlp يستخدمها لاحقًا
+COOKIES_FILE_PATH = None
+if COOKIES_B64:
+    try:
+        cookies_content = base64.b64decode(COOKIES_B64).decode("utf-8")
+        COOKIES_FILE_PATH = os.path.join(tempfile.gettempdir(), "cookies.txt")
+        with open(COOKIES_FILE_PATH, "w", encoding="utf-8") as f:
+            f.write(cookies_content)
+        logging.getLogger(__name__).info("تم تحميل ملف الكوكيز بنجاح")
+    except Exception:
+        logging.getLogger(__name__).exception("فشل فك ترميز الكوكيز - سيتم التجاهل")
+        COOKIES_FILE_PATH = None
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 
+def get_video_metadata(filepath: str):
+    """يستخرج المدة والأبعاد عبر ffprobe (مثبت مع ffmpeg)، ويولّد صورة
+    مصغّرة (thumbnail) عبر ffmpeg، عشان تيلجرام يعرض الفيديو بشكل مرتب
+    (مدة، أبعاد، صورة معاينة) بدل ما يعرضه كملف عادي."""
+    duration = 0
+    width = 0
+    height = 0
+    thumb_path = None
+
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-show_entries", "format=duration",
+                "-of", "json",
+                filepath,
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        data = json.loads(result.stdout)
+        if data.get("streams"):
+            width = int(data["streams"][0].get("width") or 0)
+            height = int(data["streams"][0].get("height") or 0)
+        duration = int(float(data.get("format", {}).get("duration") or 0))
+    except Exception:
+        logger.exception("تعذر استخراج معلومات الفيديو عبر ffprobe")
+
+    try:
+        thumb_path = filepath + "_thumb.jpg"
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", filepath,
+                "-ss", "00:00:01", "-vframes", "1",
+                "-vf", "scale=320:-1",
+                thumb_path,
+            ],
+            capture_output=True, timeout=30,
+        )
+        if not os.path.exists(thumb_path):
+            thumb_path = None
+    except Exception:
+        logger.exception("تعذر توليد صورة مصغّرة عبر ffmpeg")
+        thumb_path = None
+
+    return duration, width, height, thumb_path
+
+
+def friendly_error_message(raw_error: str) -> str:
+    """يحوّل رسائل خطأ yt-dlp التقنية (أكواد/نصوص إنجليزية) لرسالة
+    عربية واضحة تشرح المشكلة الفعلية بدل نص غير مفهوم للمستخدم."""
+    msg = raw_error.lower()
+
+    age_signals = [
+        "sign in", "age-restricted", "age restricted", "confirm your age",
+        "login required", "log in", "authentication", "private video",
+        "this account", "you need to log in",
+    ]
+    if any(sig in msg for sig in age_signals):
+        return (
+            "🔞 هذا المحتوى مقيّد بعمر أو يتطلب تسجيل دخول، وما أقدر أوصله "
+            "بدون كوكيز حساب مسجّل دخول.\n"
+            "راجع قسم إضافة الكوكيز بالـ README لتفعيل هذي الميزة."
+        )
+
+    unsupported_signals = ["unsupported url", "no extractor", "is not a valid url"]
+    if any(sig in msg for sig in unsupported_signals):
+        return "❌ هذا الرابط أو الموقع غير مدعوم حاليًا من أداة التحميل."
+
+    no_video_signals = ["no video could be found", "no video formats found", "no media found"]
+    if any(sig in msg for sig in no_video_signals):
+        return "❌ ما لقيت أي فيديو بهذا الرابط - تأكد إنه يحتوي على فيديو فعلي."
+
+    geo_signals = ["geo", "not available in your country", "blocked it in your country"]
+    if any(sig in msg for sig in geo_signals):
+        return "🌍 هذا المحتوى محجوب جغرافيًا وغير متاح من موقع السيرفر."
+
+    unavailable_signals = ["video unavailable", "this content isn't available", "has been removed", "deleted"]
+    if any(sig in msg for sig in unavailable_signals):
+        return "❌ الفيديو غير متاح - إما محذوف أو خاص أو الرابط غير صحيح."
+
+    # أي خطأ ثاني غير معروف: نعرض جزء مختصر بدل النص التقني الكامل
+    return f"❌ تعذّر التحميل لسبب غير معروف. (تفاصيل مختصرة: {raw_error[:150]})"
+
+
 @client.on(events.NewMessage(outgoing=True, chats="me"))
 async def handle_message(event):
-    """يستمع فقط لرسائلك أنت في محادثة Saved Messages"""
+    """يستمع فقط لرسائلك أنت في محادثة Saved Messages.
+    يدعم أكثر من رابط بنفس الرسالة - يعالجهم واحدًا تلو الآخر.
+    يدعم تحديد جودة اختيارية (رقم بعد الرابط، مثل 720 أو 1080)."""
     text = event.raw_text or ""
-    match = URL_REGEX.search(text)
-    if not match:
+    urls = URL_REGEX.findall(text)
+    if not urls:
         return
 
-    url = match.group(0)
-    status = await event.respond("⏳ جاري التحميل...")
+    quality_match = QUALITY_REGEX.search(text)
+    quality = int(quality_match.group(1)) if quality_match else None
+
+    if len(urls) > 1:
+        await event.respond(f"📋 لقيت {len(urls)} روابط، رح أعالجهم بالترتيب...")
+
+    for url in urls:
+        await process_single_url(event, url, quality)
+
+
+async def process_single_url(event, url: str, quality: int | None = None):
+    """يحمّل رابط واحد ويرسله، مع تحديث حي لنسبة التقدم بنفس الرسالة.
+    quality: أعلى ارتفاع مسموح (مثل 720)، أو None لأعلى جودة متوفرة."""
+    quality_label = f" (جودة {quality}p)" if quality else ""
+    status = await event.respond(f"⏳ جاري التحميل...{quality_label} 0%\n{url}")
 
     tmp_dir = tempfile.mkdtemp(prefix="ytdlp_")
     output_template = os.path.join(tmp_dir, "%(title).80s.%(ext)s")
 
+    loop = asyncio.get_event_loop()
+    progress_state = {"last_percent": -100, "last_edit_time": 0.0}
+
+    def progress_hook(d):
+        """يشتغل داخل ثريد التحميل (مو asyncio) - نستخدم
+        run_coroutine_threadsafe عشان نعدّل الرسالة بأمان من هناك."""
+        try:
+            if d.get("status") == "downloading":
+                percent_str = (d.get("_percent_str") or "").strip().replace("%", "")
+                percent = float(percent_str) if percent_str else None
+                if percent is None:
+                    return
+
+                now = time.monotonic()
+                # تحديث كل 5% تقدّم أو كل 4 ثوانٍ - عشان ما نتجاوز حد
+                # تيلجرام لتعديل الرسائل المتكرر (Flood limit)
+                if (percent - progress_state["last_percent"] >= 5
+                        or now - progress_state["last_edit_time"] >= 4):
+                    progress_state["last_percent"] = percent
+                    progress_state["last_edit_time"] = now
+                    new_text = f"⏳ جاري التحميل... {percent:.0f}%\n{url}"
+                    asyncio.run_coroutine_threadsafe(
+                        status.edit(new_text), loop
+                    )
+            elif d.get("status") == "finished":
+                asyncio.run_coroutine_threadsafe(
+                    status.edit(f"✅ اكتمل التحميل، جاري المعالجة...\n{url}"),
+                    loop,
+                )
+        except Exception:
+            logger.exception("خطأ داخل progress_hook")
+
+    if quality:
+        # نحدد سقف ارتفاع الفيديو (height) حسب الجودة المطلوبة، مع نفس
+        # ترتيب الأفضلية (MP4 مباشر > أي شي مباشر > MP4 مجزأ > أي شي)
+        fmt = (
+            f"best[height<={quality}][protocol!*=m3u8][ext=mp4]/"
+            f"best[height<={quality}][protocol!*=m3u8]/"
+            f"best[height<={quality}][ext=mp4]/"
+            f"best[height<={quality}]/"
+            f"best[protocol!*=m3u8][ext=mp4]/best[protocol!*=m3u8]/best[ext=mp4]/best"
+        )
+    else:
+        # بدون تحديد جودة: أعلى جودة متوفرة بالموقع مباشرة
+        fmt = "best[protocol!*=m3u8][ext=mp4]/best[protocol!*=m3u8]/best[ext=mp4]/best"
+
     ydl_opts = {
         "outtmpl": output_template,
-        # نفضّل صيغة MP4 مباشرة (غير مجزّأة) لو متوفرة - أسرع بكثير لأنها
-        # ملف واحد جاهز بدون قطع. لو غير متوفرة (أغلب فيديوهات X الطويلة)
-        # نرجع لأفضل جودة حتى لو كانت مجزأة (HLS).
-        "format": "best[protocol!*=m3u8][ext=mp4]/best[protocol!*=m3u8]/best[ext=mp4]/best",
+        "format": fmt,
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
@@ -69,7 +242,13 @@ async def handle_message(event):
         # تحميل عدة أجزاء بالتوازي بدل التسلسل - يسرّع الفيديوهات
         # المجزأة (HLS) بشكل كبير جدًا لأنها عملية شبكة وليست معالجة.
         "concurrent_fragment_downloads": 8,
+        "progress_hooks": [progress_hook],
     }
+
+    # لو فيه كوكيز مضبوطة، نمررها لـ yt-dlp عشان يقدر يحمّل محتوى
+    # يتطلب تسجيل دخول (حسابات خاصة، محتوى مقيّد بعمر، إلخ)
+    if COOKIES_FILE_PATH:
+        ydl_opts["cookiefile"] = COOKIES_FILE_PATH
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -85,24 +264,39 @@ async def handle_message(event):
         file_size = os.path.getsize(filename)
         if file_size > MAX_FILE_SIZE:
             await status.edit(
-                f"⚠️ الملف أكبر من {MAX_FILE_SIZE // (1024*1024)} ميجا، تعذر إرساله."
+                f"⚠️ الملف أكبر من {MAX_FILE_SIZE // (1024*1024)} ميجا، تعذر إرساله.\n{url}"
             )
             return
 
-        await status.edit("📤 جاري الإرسال...")
+        await status.edit(f"📤 جاري الإرسال...\n{url}")
+
+        duration, width, height, thumb_path = get_video_metadata(filename)
+        attributes = None
+        if duration or width or height:
+            attributes = [
+                DocumentAttributeVideo(
+                    duration=duration,
+                    w=width or 640,
+                    h=height or 360,
+                    supports_streaming=True,
+                )
+            ]
+
         await client.send_file(
             "me",
             filename,
             caption=info.get("title", ""),
             supports_streaming=True,
+            attributes=attributes,
+            thumb=thumb_path,
         )
         await status.delete()
 
     except yt_dlp.utils.DownloadError as e:
-        await status.edit(f"❌ فشل التحميل: {str(e)[:300]}")
+        await status.edit(f"{friendly_error_message(str(e))}\n{url}")
     except Exception as e:
         logger.exception("خطأ غير متوقع")
-        await status.edit(f"❌ حدث خطأ: {str(e)[:300]}")
+        await status.edit(f"❌ حدث خطأ غير متوقع: {str(e)[:150]}\n{url}")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
