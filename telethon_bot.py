@@ -218,10 +218,11 @@ async def process_single_url(event, url: str, quality: int | None = None):
                     return
 
                 now = time.monotonic()
-                # تحديث كل 25% تقدّم أو كل 15 ثانية كحد أدنى - متحفظين
-                # جدًا لتجنب أي احتكاك مع حد تيلجرام لتعديل الرسائل
-                if (percent - progress_state["last_percent"] >= 25
-                        or now - progress_state["last_edit_time"] >= 15):
+                # تحديث فقط لو مرّت 5 ثوانٍ على الأقل من آخر تحديث -
+                # نعتمد على الوقت فقط (مو النسبة) عشان ما تصير دفعة
+                # تحديثات متلاحقة بالفيديوهات السريعة (تصطدم بحد تيلجرام
+                # وتخلي الرسائل المهمة، زي "اكتمل 100%"، تضيع بصمت).
+                if now - progress_state["last_edit_time"] >= 5:
                     progress_state["last_percent"] = percent
                     progress_state["last_edit_time"] = now
                     new_text = f"⏳ جاري التحميل... {percent:.0f}%\n{url}"
@@ -289,7 +290,9 @@ async def process_single_url(event, url: str, quality: int | None = None):
 
         await safe_edit(status, f"📤 جاري الإرسال... 0%\n{url}")
 
-        duration, width, height, thumb_path = get_video_metadata(filename)
+        duration, width, height, thumb_path = await asyncio.to_thread(
+            get_video_metadata, filename
+        )
         attributes = None
         if duration or width or height:
             attributes = [
@@ -311,9 +314,10 @@ async def process_single_url(event, url: str, quality: int | None = None):
                     return
                 percent = current / total * 100
                 now = time.monotonic()
-                if (percent - upload_state["last_percent"] >= 25
-                        or now - upload_state["last_edit_time"] >= 15
-                        or percent >= 100):
+                # نفس منطق الوقت فقط (مو النسبة) لتفادي دفعات التحديث
+                # السريعة بالملفات الصغيرة اللي ترفع خلال ثوانٍ قليلة
+                is_done = percent >= 100
+                if now - upload_state["last_edit_time"] >= 5 or is_done:
                     upload_state["last_percent"] = percent
                     upload_state["last_edit_time"] = now
                     asyncio.ensure_future(
