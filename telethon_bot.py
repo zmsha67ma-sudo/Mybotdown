@@ -24,7 +24,6 @@
 
 import asyncio
 import base64
-import json
 import logging
 import os
 import re
@@ -78,53 +77,34 @@ client = TelegramClient(
 )
 
 
-def get_video_metadata(filepath: str):
-    """يستخرج المدة والأبعاد عبر ffprobe (مثبت مع ffmpeg)، ويولّد صورة
-    مصغّرة (thumbnail) عبر ffmpeg، عشان تيلجرام يعرض الفيديو بشكل مرتب
-    (مدة، أبعاد، صورة معاينة) بدل ما يعرضه كملف عادي."""
-    duration = 0
-    width = 0
-    height = 0
-    thumb_path = None
-
+def generate_thumbnail(filepath: str):
+    """يولّد صورة مصغّرة (thumbnail) عبر ffmpeg فقط - أخف بكثير من قبل
+    لأننا صرنا نجيب المدة والأبعاد من yt-dlp نفسه بدل استدعاء ffprobe
+    كعملية منفصلة (توفير كامل لعملية subprocess زايدة).
+    كمان نضع -ss قبل -i (البحث من طرف الإدخال) بدل بعده: هذا يخلي ffmpeg
+    يقفز مباشرة لأقرب "keyframe" بدون فك تشفير كل الثواني اللي قبلها،
+    فايدة كبيرة بالسرعة والمعالج خصوصًا بالفيديوهات الطويلة، وبدون أي
+    تأثير على جودة الفيديو الأصلي (الصورة المصغّرة فقط للمعاينة)."""
+    thumb_path = filepath + "_thumb.jpg"
     try:
-        result = subprocess.run(
-            [
-                "ffprobe", "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=width,height",
-                "-show_entries", "format=duration",
-                "-of", "json",
-                filepath,
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-        data = json.loads(result.stdout)
-        if data.get("streams"):
-            width = int(data["streams"][0].get("width") or 0)
-            height = int(data["streams"][0].get("height") or 0)
-        duration = int(float(data.get("format", {}).get("duration") or 0))
-    except Exception:
-        logger.exception("تعذر استخراج معلومات الفيديو عبر ffprobe")
-
-    try:
-        thumb_path = filepath + "_thumb.jpg"
         subprocess.run(
             [
-                "ffmpeg", "-y", "-i", filepath,
-                "-ss", "00:00:01", "-vframes", "1",
+                "ffmpeg", "-y",
+                "-ss", "1",           # بحث سريع قبل فتح الملف
+                "-i", filepath,
+                "-frames:v", "1",
                 "-vf", "scale=320:-1",
+                "-q:v", "5",
                 thumb_path,
             ],
-            capture_output=True, timeout=30,
+            capture_output=True, timeout=15,
         )
         if not os.path.exists(thumb_path):
-            thumb_path = None
+            return None
+        return thumb_path
     except Exception:
         logger.exception("تعذر توليد صورة مصغّرة عبر ffmpeg")
-        thumb_path = None
-
-    return duration, width, height, thumb_path
+        return None
 
 
 def friendly_error_message(raw_error: str) -> str:
@@ -290,9 +270,13 @@ async def process_single_url(event, url: str, quality: int | None = None):
 
         await safe_edit(status, f"📤 جاري الإرسال... 0%\n{url}")
 
-        duration, width, height, thumb_path = await asyncio.to_thread(
-            get_video_metadata, filename
-        )
+        # المدة والأبعاد نجيبها مباشرة من بيانات yt-dlp نفسه (كان أصلاً
+        # يجلبها من الموقع)، بدون أي استدعاء إضافي لـ ffprobe - توفير
+        # كامل لعملية subprocess زايدة كانت تستهلك معالج بلا داعي.
+        duration = int(info.get("duration") or 0)
+        width = int(info.get("width") or 0)
+        height = int(info.get("height") or 0)
+        thumb_path = await asyncio.to_thread(generate_thumbnail, filename)
         attributes = None
         if duration or width or height:
             attributes = [
