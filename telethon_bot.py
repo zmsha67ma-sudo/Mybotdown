@@ -10,6 +10,12 @@
   https://x.com/xxx/status/123 720
   (الأرقام المدعومة: 240, 360, 480, 720, 1080, 1440, 2160)
   لو ما حددت رقم، يحمّل أعلى جودة موجودة تلقائيًا.
+- لإلغاء أي تحميل جارٍ، أرسل كلمة: الغاء (أو إلغاء أو cancel)
+- لمسح أي ملفات مؤقتة متراكمة من عمليات سابقة، أرسل: تنظيف (أو مسح الكاش)
+- لإعادة تشغيل السيرفر بالكامل، أرسل: اعادة تشغيل (أو restart)
+- لعرض حالة السيرفر (تحميلات شغّالة، ذاكرة، مساحة قرص)، أرسل: حالة (أو status)
+- لعرض إحصائيات الاستخدام الكلي (حجم التحميلات منذ آخر تشغيل)، أرسل: احصائيات (أو stats)
+- لعرض قائمة كل الأوامر المتاحة، أرسل: مساعدة (أو help)
 
 متغيرات البيئة المطلوبة:
 - API_ID, API_HASH: من https://my.telegram.org
@@ -30,7 +36,14 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
+from datetime import datetime
+
+try:
+    import resource  # متوفر فقط على أنظمة Linux/Unix (نفس بيئة Render)
+except ImportError:
+    resource = None
 
 from aiohttp import web
 from telethon import TelegramClient, events
@@ -75,6 +88,18 @@ client = TelegramClient(
     # فورًا عشان نتجاهله بأنفسنا عبر safe_edit بدون أي تأخير حقيقي.
     flood_sleep_threshold=0,
 )
+
+# قائمة العمليات الجارية حاليًا (تحميل/إرسال) - كل عملية عندها
+# threading.Event خاص فيها، لو انضبط (set) نوقف التحميل من داخل
+# progress_hook مباشرة. بما إن الاستخدام شخصي (حساب واحد بس)، قائمة
+# بسيطة كافية بدون تعقيد إضافي.
+active_operations = []
+CANCELLED_MARKER = "USER_CANCELLED_OPERATION"
+
+# إحصائيات بسيطة تُحفظ بالذاكرة فقط (تصفر عند أي إعادة تشغيل) - تساعدك
+# تتابع استهلاكك من حصة الباندويدث الشهرية عند Render (100 جيجا مجانًا)
+BOT_START_TIME = datetime.now()
+stats = {"completed_downloads": 0, "total_bytes_sent": 0, "failed_downloads": 0}
 
 
 def generate_thumbnail(filepath: str):
@@ -155,6 +180,177 @@ async def safe_edit(status_msg, text: str):
         logger.exception("خطأ غير متوقع أثناء تعديل الرسالة")
 
 
+@client.on(events.NewMessage(outgoing=True, chats="me", pattern=r"(?i)^(الغاء|إلغاء|cancel|stop)$"))
+async def handle_cancel(event):
+    """يلغي كل التحميلات الجارية حاليًا (لو فيه أكثر من رابط قيد
+    المعالجة). يشتغل بس لو الرسالة عبارة عن كلمة إلغاء فقط، عشان ما
+    يتعارض مع رسائل عادية فيها كلمة "الغاء" ضمن سياق ثاني."""
+    if not active_operations:
+        await event.respond("ℹ️ ما فيه أي تحميل جارٍ حاليًا لإلغائه.")
+        return
+
+    count = len(active_operations)
+    for op in list(active_operations):
+        op["cancel_event"].set()
+
+    await event.respond(f"🛑 يتم إلغاء {count} عملية جارية...")
+
+
+def _clear_leftover_temp_dirs(protected_dirs):
+    """يمسح أي مجلدات تحميل مؤقتة (ytdlp_*) متبقية من عمليات قديمة
+    (توقفت فجأة قبل ما توصل لخطوة التنظيف الطبيعية، مثل انقطاع مفاجئ
+    أو تعطل السيرفر)، بدون ما يلمس أي عملية شغّالة حاليًا."""
+    base = tempfile.gettempdir()
+    freed_bytes = 0
+    removed_count = 0
+    try:
+        for name in os.listdir(base):
+            if not name.startswith("ytdlp_"):
+                continue
+            full_path = os.path.join(base, name)
+            if full_path in protected_dirs:
+                continue
+            try:
+                size = 0
+                for dirpath, _, filenames in os.walk(full_path):
+                    for f in filenames:
+                        fp = os.path.join(dirpath, f)
+                        if os.path.exists(fp):
+                            size += os.path.getsize(fp)
+                shutil.rmtree(full_path, ignore_errors=True)
+                freed_bytes += size
+                removed_count += 1
+            except Exception:
+                logger.exception(f"تعذر حذف المجلد المؤقت: {full_path}")
+    except Exception:
+        logger.exception("تعذر مسح الملفات المؤقتة")
+    return removed_count, freed_bytes
+
+
+@client.on(events.NewMessage(outgoing=True, chats="me", pattern=r"(?i)^(تنظيف|مسح الكاش|clean|clear cache)$"))
+async def handle_clean_cache(event):
+    """يمسح أي ملفات تحميل مؤقتة متبقية من عمليات سابقة توقفت بشكل
+    غير طبيعي (تعطل، انقطاع اتصال، إلخ)، دون التأثير على أي تحميل
+    شغّال حاليًا."""
+    status = await event.respond("🧹 جاري تنظيف الملفات المؤقتة...")
+    protected = {op["tmp_dir"] for op in active_operations}
+    removed_count, freed_bytes = await asyncio.to_thread(
+        _clear_leftover_temp_dirs, protected
+    )
+    freed_mb = freed_bytes / (1024 * 1024)
+    if removed_count:
+        await safe_edit(
+            status,
+            f"✅ تم حذف {removed_count} مجلد مؤقت متبقٍّ، وتحرير {freed_mb:.1f} ميجا."
+        )
+    else:
+        await safe_edit(status, "✅ ما فيه أي ملفات مؤقتة متراكمة - كل شي نظيف.")
+
+
+@client.on(events.NewMessage(outgoing=True, chats="me", pattern=r"(?i)^(اعادة تشغيل|إعادة تشغيل|restart)$"))
+async def handle_restart(event):
+    """يعيد تشغيل السيرفر بالكامل. يوقف العملية الحالية عمدًا، وبما إن
+    Render يراقب الخدمة ويعيد تشغيلها تلقائيًا عند توقفها (نفس سلوكه
+    مع أي تعطل)، هذا يعادل "إعادة تشغيل" حقيقية بدون حاجة للدخول للوحة
+    تحكم Render يدويًا."""
+    if active_operations:
+        await event.respond(
+            f"⚠️ فيه {len(active_operations)} عملية تحميل شغّالة حاليًا. "
+            "أرسل \"الغاء\" أول لو تبي توقفها، أو أرسل \"تأكيد إعادة التشغيل\" "
+            "للمتابعة رغم ذلك."
+        )
+        return
+
+    await event.respond("🔄 جاري إعادة تشغيل السيرفر... البوت بيرجع يشتغل خلال دقيقة تقريبًا.")
+    await asyncio.sleep(1.5)  # نضمن وصول الرسالة قبل إيقاف العملية
+    logger.info("إعادة تشغيل مطلوبة يدويًا - إيقاف العملية الآن")
+    os._exit(0)
+
+
+@client.on(events.NewMessage(outgoing=True, chats="me", pattern=r"(?i)^تأكيد إعادة التشغيل$"))
+async def handle_force_restart(event):
+    """تأكيد إعادة التشغيل رغم وجود تحميلات شغّالة - تُفقد هذي
+    التحميلات الجارية بدون استكمال."""
+    await event.respond("🔄 جاري إعادة التشغيل رغم العمليات الجارية...")
+    await asyncio.sleep(1.5)
+    os._exit(0)
+
+
+@client.on(events.NewMessage(outgoing=True, chats="me", pattern=r"(?i)^(حالة|status)$"))
+async def handle_status(event):
+    """يعرض حالة السيرفر الحالية: تحميلات شغّالة، مساحة القرص
+    المتبقية، واستهلاك الذاكرة التقريبي - يفيد لتشخيص أي بطء غير
+    طبيعي (مثلاً امتلاء القرص أو تراكم ذاكرة)."""
+    lines = ["📊 **حالة السيرفر**\n"]
+
+    if active_operations:
+        lines.append(f"⏳ تحميلات شغّالة الآن: {len(active_operations)}")
+        for op in active_operations:
+            lines.append(f"  • {op['url'][:60]}")
+    else:
+        lines.append("⏳ ما فيه أي تحميل شغّال حاليًا")
+
+    try:
+        disk = shutil.disk_usage(tempfile.gettempdir())
+        free_mb = disk.free / (1024 * 1024)
+        total_mb = disk.total / (1024 * 1024)
+        lines.append(f"\n💾 مساحة القرص المتاحة: {free_mb:.0f} / {total_mb:.0f} ميجا")
+    except Exception:
+        lines.append("\n💾 تعذر قراءة معلومات القرص")
+
+    if resource:
+        try:
+            mem_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            lines.append(f"🧠 أعلى استهلاك ذاكرة: {mem_kb / 1024:.0f} ميجا")
+        except Exception:
+            pass
+
+    uptime = datetime.now() - BOT_START_TIME
+    hours = int(uptime.total_seconds() // 3600)
+    minutes = int((uptime.total_seconds() % 3600) // 60)
+    lines.append(f"⏱️ يعمل منذ آخر تشغيل: {hours} ساعة و{minutes} دقيقة")
+
+    await event.respond("\n".join(lines))
+
+
+@client.on(events.NewMessage(outgoing=True, chats="me", pattern=r"(?i)^(احصائيات|إحصائيات|stats)$"))
+async def handle_stats(event):
+    """يعرض إحصائيات الاستخدام الكلي منذ آخر إعادة تشغيل - يساعدك
+    تتابع استهلاكك من حصة Render الشهرية (100 جيجا باندويدث مجانًا)."""
+    sent_gb = stats["total_bytes_sent"] / (1024 ** 3)
+    percent_of_limit = (sent_gb / 100) * 100  # من أصل 100 جيجا الحصة الشهرية
+
+    text = (
+        "📈 **إحصائيات الاستخدام** (منذ آخر إعادة تشغيل)\n\n"
+        f"✅ تحميلات ناجحة: {stats['completed_downloads']}\n"
+        f"❌ تحميلات فاشلة: {stats['failed_downloads']}\n"
+        f"📦 إجمالي حجم البيانات المرسلة: {sent_gb:.2f} جيجا\n\n"
+        f"⚠️ هذا يعادل تقريبًا {percent_of_limit:.1f}% من حصة الباندويدث "
+        "الشهرية المجانية عند Render (100 جيجا).\n\n"
+        "ملاحظة: هذي الأرقام تصفر تلقائيًا عند أي إعادة تشغيل للسيرفر "
+        "(يدوي أو تلقائي من Render)، فهي تقريبية وليست دقيقة 100% لكامل الشهر."
+    )
+    await event.respond(text)
+
+
+@client.on(events.NewMessage(outgoing=True, chats="me", pattern=r"(?i)^(مساعدة|help)$"))
+async def handle_help(event):
+    """يعرض قائمة كل الأوامر المتاحة بالبوت."""
+    text = (
+        "🤖 **قائمة أوامر البوت**\n\n"
+        "📥 أرسل أي رابط فيديو → يحمّله ويرسله لك تلقائيًا\n"
+        "🎚️ أضف رقم جودة بعد الرابط (مثل: 720) → يحمّل بتلك الجودة\n\n"
+        "**أوامر التحكم:**\n"
+        "• `الغاء` - يوقف أي تحميل شغّال حاليًا\n"
+        "• `تنظيف` - يمسح الملفات المؤقتة المتراكمة\n"
+        "• `اعادة تشغيل` - يعيد تشغيل السيرفر بالكامل\n"
+        "• `حالة` - يعرض حالة السيرفر الحالية (تحميلات، قرص، ذاكرة)\n"
+        "• `احصائيات` - يعرض إجمالي الاستخدام منذ آخر تشغيل\n"
+        "• `مساعدة` - يعرض هذي القائمة"
+    )
+    await event.respond(text)
+
+
 @client.on(events.NewMessage(outgoing=True, chats="me"))
 async def handle_message(event):
     """يستمع فقط لرسائلك أنت في محادثة Saved Messages.
@@ -179,18 +375,30 @@ async def process_single_url(event, url: str, quality: int | None = None):
     """يحمّل رابط واحد ويرسله، مع تحديث حي لنسبة التقدم بنفس الرسالة.
     quality: أعلى ارتفاع مسموح (مثل 720)، أو None لأعلى جودة متوفرة."""
     quality_label = f" (جودة {quality}p)" if quality else ""
-    status = await event.respond(f"⏳ جاري التحميل...{quality_label} 0%\n{url}")
+    status = await event.respond(
+        f"⏳ جاري التحميل...{quality_label} 0%\n{url}\n\n"
+        "(أرسل \"الغاء\" لإيقاف هذا التحميل)"
+    )
 
     tmp_dir = tempfile.mkdtemp(prefix="ytdlp_")
     output_template = os.path.join(tmp_dir, "%(title).80s.%(ext)s")
 
     loop = asyncio.get_event_loop()
     progress_state = {"last_percent": -100, "last_edit_time": 0.0}
+    cancel_event = threading.Event()
+    operation = {"cancel_event": cancel_event, "url": url, "tmp_dir": tmp_dir}
+    active_operations.append(operation)
 
     def progress_hook(d):
         """يشتغل داخل ثريد التحميل (مو asyncio) - نستخدم
         run_coroutine_threadsafe عشان نعدّل الرسالة بأمان من هناك."""
         try:
+            # لو المستخدم طلب الإلغاء، نوقف التحميل فورًا من هنا - رفع
+            # استثناء داخل progress_hook يخلي yt-dlp يوقف العملية مباشرة
+            # بدل ما ينتظر اكتمال التحميل ثم نتجاهل النتيجة.
+            if cancel_event.is_set():
+                raise RuntimeError(CANCELLED_MARKER)
+
             if d.get("status") == "downloading":
                 percent_str = (d.get("_percent_str") or "").strip().replace("%", "")
                 percent = float(percent_str) if percent_str else None
@@ -205,7 +413,10 @@ async def process_single_url(event, url: str, quality: int | None = None):
                 if now - progress_state["last_edit_time"] >= 5:
                     progress_state["last_percent"] = percent
                     progress_state["last_edit_time"] = now
-                    new_text = f"⏳ جاري التحميل... {percent:.0f}%\n{url}"
+                    new_text = (
+                        f"⏳ جاري التحميل... {percent:.0f}%\n{url}\n\n"
+                        "(أرسل \"الغاء\" لإيقاف هذا التحميل)"
+                    )
                     asyncio.run_coroutine_threadsafe(
                         safe_edit(status, new_text), loop
                     )
@@ -214,6 +425,8 @@ async def process_single_url(event, url: str, quality: int | None = None):
                     safe_edit(status, f"✅ التحميل 100% - جاري التجهيز...\n{url}"),
                     loop,
                 )
+        except RuntimeError:
+            raise
         except Exception:
             logger.exception("خطأ داخل progress_hook")
 
@@ -294,6 +507,8 @@ async def process_single_url(event, url: str, quality: int | None = None):
             """يشتغل داخل asyncio (Telethon يستدعيها مباشرة أثناء الرفع)،
             نجدول تعديل الرسالة بدون ما نوقف الرفع نفسه."""
             try:
+                if cancel_event.is_set():
+                    raise RuntimeError(CANCELLED_MARKER)
                 if total <= 0:
                     return
                 percent = current / total * 100
@@ -307,6 +522,8 @@ async def process_single_url(event, url: str, quality: int | None = None):
                     asyncio.ensure_future(
                         safe_edit(status, f"📤 جاري الإرسال... {percent:.0f}%\n{url}")
                     )
+            except RuntimeError:
+                raise
             except Exception:
                 logger.exception("خطأ داخل upload_progress")
 
@@ -319,17 +536,33 @@ async def process_single_url(event, url: str, quality: int | None = None):
             thumb=thumb_path,
             progress_callback=upload_progress,
         )
+        stats["completed_downloads"] += 1
+        stats["total_bytes_sent"] += file_size
         try:
             await status.delete()
         except FloodWaitError:
             pass
 
+    except RuntimeError as e:
+        if str(e) == CANCELLED_MARKER:
+            await safe_edit(status, f"🛑 تم إلغاء العملية بنجاح.\n{url}")
+        else:
+            stats["failed_downloads"] += 1
+            logger.exception("خطأ غير متوقع")
+            await safe_edit(status, f"❌ حدث خطأ غير متوقع: {str(e)[:150]}\n{url}")
     except yt_dlp.utils.DownloadError as e:
-        await safe_edit(status, f"{friendly_error_message(str(e))}\n{url}")
+        if CANCELLED_MARKER in str(e):
+            await safe_edit(status, f"🛑 تم إلغاء العملية بنجاح.\n{url}")
+        else:
+            stats["failed_downloads"] += 1
+            await safe_edit(status, f"{friendly_error_message(str(e))}\n{url}")
     except Exception as e:
+        stats["failed_downloads"] += 1
         logger.exception("خطأ غير متوقع")
         await safe_edit(status, f"❌ حدث خطأ غير متوقع: {str(e)[:150]}\n{url}")
     finally:
+        if operation in active_operations:
+            active_operations.remove(operation)
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
