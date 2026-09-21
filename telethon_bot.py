@@ -431,25 +431,22 @@ async def process_single_url(event, url: str, quality: int | None = None):
             logger.exception("خطأ داخل progress_hook")
 
     if quality:
-        # لما تحدد جودة بنفسك (مثل 720)، نحترم السقف اللي طلبته بالضبط،
-        # ونفضّل صيغة MP4 مباشرة (أسرع) بس فقط لو نفس الجودة المطلوبة
-        # متوفرة بها - ما تحدث فرق جودة لأنك أصلاً حددت سقف معين.
-        fmt = (
-            f"best[height<={quality}][protocol!*=m3u8][ext=mp4]/"
-            f"best[height<={quality}][protocol!*=m3u8]/"
-            f"best[height<={quality}][ext=mp4]/"
-            f"best[height<={quality}]"
-        )
+        # لما تحدد جودة بنفسك (مثل 1080)، نسمح بدمج فيديو+صوت منفصلين
+        # لو احتاج الأمر، عشان نضمن الوصول لأعلى جودة حقيقية متوفرة
+        # تحت هذا السقف، حتى لو ما كانت بصيغة جاهزة مسبقًا.
+        fmt = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]"
     else:
-        # بدون تحديد جودة: نطلب أعلى جودة موجودة بالموقع دايمًا،
-        # بغض النظر عن كونها MP4 مباشر أو مجزأة (HLS) - الأولوية
-        # المطلقة للجودة، والتحميل المتوازي (concurrent_fragment_
-        # downloads) أصلاً يعوّض بطء HLS المحتمل بدون التضحية بالجودة.
-        fmt = "best"
+        # بدون تحديد جودة: نطلب أعلى جودة موجودة بالموقع دايمًا، حتى
+        # لو احتاجت دمج فيديو منفصل مع صوت منفصل (bestvideo+bestaudio) -
+        # هذا ضروري لأن أعلى جودة بمواقع كثيرة (يوتيوب وغيره) تكون
+        # بصيغتين منفصلتين، ومحصورين بـ"best" وحدها كان يهبط الجودة
+        # لأقصى صيغة "جاهزة مسبقًا" متوفرة، مو أعلى جودة حقيقية بالموقع.
+        fmt = "bestvideo+bestaudio/best"
 
     ydl_opts = {
         "outtmpl": output_template,
         "format": fmt,
+        "merge_output_format": "mp4",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
