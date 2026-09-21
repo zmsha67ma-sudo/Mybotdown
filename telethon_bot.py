@@ -470,6 +470,21 @@ async def process_single_url(event, url: str, quality: int | None = None):
                 base, _ = os.path.splitext(filename)
                 filename = base + ".mp4"
 
+        # تسجيل كل الصيغ المتوفرة بالمصدر بالسجلات (Logs) - يساعدنا
+        # نشخّص لو صار فرق بين "أعلى جودة معلنة" و"أعلى جودة فعليًا
+        # متاحة للتحميل عبر yt-dlp" (أحيانًا تختلف حسب الموقع والكوكيز)
+        try:
+            available = info.get("formats") or []
+            heights = sorted({f.get("height") for f in available if f.get("height")}, reverse=True)
+            chosen_height = info.get("height")
+            chosen_width = info.get("width")
+            logger.info(
+                f"[{url}] الجودات المتوفرة بالمصدر: {heights} | "
+                f"المختارة فعليًا: {chosen_width}x{chosen_height}"
+            )
+        except Exception:
+            pass
+
         if not os.path.exists(filename):
             raise FileNotFoundError("تعذر إيجاد الملف بعد التحميل")
 
@@ -527,10 +542,14 @@ async def process_single_url(event, url: str, quality: int | None = None):
             except Exception:
                 logger.exception("خطأ داخل upload_progress")
 
+        video_title = info.get("title", "")
+        resolution_note = f"📐 {width}x{height}" if (width and height) else ""
+        caption = f"{video_title}\n{resolution_note}".strip()
+
         await client.send_file(
             "me",
             filename,
-            caption=info.get("title", ""),
+            caption=caption,
             supports_streaming=True,
             attributes=attributes,
             thumb=thumb_path,
