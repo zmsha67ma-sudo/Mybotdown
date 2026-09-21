@@ -431,18 +431,21 @@ async def process_single_url(event, url: str, quality: int | None = None):
             logger.exception("خطأ داخل progress_hook")
 
     if quality:
-        # نحدد سقف ارتفاع الفيديو (height) حسب الجودة المطلوبة، مع نفس
-        # ترتيب الأفضلية (MP4 مباشر > أي شي مباشر > MP4 مجزأ > أي شي)
+        # لما تحدد جودة بنفسك (مثل 720)، نحترم السقف اللي طلبته بالضبط،
+        # ونفضّل صيغة MP4 مباشرة (أسرع) بس فقط لو نفس الجودة المطلوبة
+        # متوفرة بها - ما تحدث فرق جودة لأنك أصلاً حددت سقف معين.
         fmt = (
             f"best[height<={quality}][protocol!*=m3u8][ext=mp4]/"
             f"best[height<={quality}][protocol!*=m3u8]/"
             f"best[height<={quality}][ext=mp4]/"
-            f"best[height<={quality}]/"
-            f"best[protocol!*=m3u8][ext=mp4]/best[protocol!*=m3u8]/best[ext=mp4]/best"
+            f"best[height<={quality}]"
         )
     else:
-        # بدون تحديد جودة: أعلى جودة متوفرة بالموقع مباشرة
-        fmt = "best[protocol!*=m3u8][ext=mp4]/best[protocol!*=m3u8]/best[ext=mp4]/best"
+        # بدون تحديد جودة: نطلب أعلى جودة موجودة بالموقع دايمًا،
+        # بغض النظر عن كونها MP4 مباشر أو مجزأة (HLS) - الأولوية
+        # المطلقة للجودة، والتحميل المتوازي (concurrent_fragment_
+        # downloads) أصلاً يعوّض بطء HLS المحتمل بدون التضحية بالجودة.
+        fmt = "best"
 
     ydl_opts = {
         "outtmpl": output_template,
