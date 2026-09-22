@@ -460,7 +460,7 @@ async def process_single_url(event, url: str, quality: int | None = None):
         # (تتجاوز غالبًا تشديدات الحماية الجديدة المطبّقة على واجهة
         # الويب العادية)، مع الرجوع لواجهة الويب لو فشلت.
         "extractor_args": {
-            "youtube": {"player_client": ["android", "web"]},
+            "youtube": {"player_client": ["ios", "android", "web"]},
         },
     }
 
