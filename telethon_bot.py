@@ -455,6 +455,13 @@ async def process_single_url(event, url: str, quality: int | None = None):
         # المجزأة (HLS) بشكل كبير جدًا لأنها عملية شبكة وليست معالجة.
         "concurrent_fragment_downloads": 8,
         "progress_hooks": [progress_hook],
+        # حل احتياطي معروف لمشكلة "The page needs to be reloaded" من
+        # يوتيوب - نطلب البيانات عبر واجهة تطبيق أندرويد الداخلية
+        # (تتجاوز غالبًا تشديدات الحماية الجديدة المطبّقة على واجهة
+        # الويب العادية)، مع الرجوع لواجهة الويب لو فشلت.
+        "extractor_args": {
+            "youtube": {"player_client": ["android", "web"]},
+        },
     }
 
     # لو فيه كوكيز مضبوطة، نمررها لـ yt-dlp عشان يقدر يحمّل محتوى
