@@ -42,6 +42,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.parse
 from datetime import datetime
 
 try:
@@ -71,6 +72,32 @@ COOKIES_B64 = os.environ.get("COOKIES_B64", "")
 MAX_FILE_SIZE = 2000 * 1024 * 1024  # 2 جيجا
 URL_REGEX = re.compile(r"https?://\S+")
 QUALITY_REGEX = re.compile(r"\b(240|360|480|720|1080|1440|2160)\b")
+
+# مواقع "مرآة" (نفس المحتوى، دومين مختلف) غير مدعومة مباشرة من yt-dlp
+# فيرجع لها لآلية استخراج عامة (generic extractor) ما تقدر تكتشف
+# خيارات الجودة الحقيقية (ترجع جودة واحدة فقط بدون بيانات height) -
+# نبدّل الدومين للأساسي المدعوم تلقائيًا قبل أي معالجة، عشان يقدر
+# yt-dlp يستخرج بيانات الجودة الصحيحة دايمًا بغض النظر عن أي دومين
+# أرسل المستخدم الرابط منه.
+MIRROR_DOMAIN_REWRITES = {
+    "xnxx-arabic.com": "xnxx.com",
+    "www.xnxx-arabic.com": "www.xnxx.com",
+    "xvideos-ar.com": "xvideos.com",
+    "www.xvideos-ar.com": "www.xvideos.com",
+}
+
+
+def normalize_url(url: str) -> str:
+    """يستبدل دومين الرابط بالدومين الأساسي المدعوم لو كان من إحدى
+    دومينات المرايا المعروفة أعلاه، ويترجع الرابط كما هو غير ذلك."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        new_host = MIRROR_DOMAIN_REWRITES.get(parsed.netloc.lower())
+        if not new_host:
+            return url
+        return urllib.parse.urlunsplit(parsed._replace(netloc=new_host))
+    except Exception:
+        return url
 
 # لو مزوّد كوكيز، نفك ترميزها ونكتبها بملف عشان yt-dlp يستخدمها لاحقًا
 COOKIES_FILE_PATH = None
@@ -413,7 +440,7 @@ async def handle_message(event):
             )
         return
 
-    urls = URL_REGEX.findall(text)
+    urls = [normalize_url(u) for u in URL_REGEX.findall(text)]
     if not urls:
         return
 
