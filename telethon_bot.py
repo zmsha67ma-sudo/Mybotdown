@@ -106,10 +106,19 @@ BOT_START_TIME = datetime.now()
 stats = {"completed_downloads": 0, "total_bytes_sent": 0, "failed_downloads": 0}
 
 # كيان (entity) حسابك نفسه - نجيبه مرة وحدة بعد بدء تشغيل العميل
-# ونعيد استخدامه، بدل تمرير النص "me" مباشرة لـ client.conversation()
-# اللي يسبب خطأ TypeError (Cannot cast InputPeerSelf to any kind of
-# Peer) بمكتبة Telethon عند بعض النسخ.
+# ونعيد استخدامه بكل مكان يحتاج إرسال رسالة لنفسك.
 SELF_ENTITY = None
+
+# طلب اختيار الجودة المفتوح حاليًا (لو فيه واحد) - بديل عن
+# client.conversation() اللي طلع إنها غير متوافقة أصلاً مع محادثة
+# الحساب مع نفسه (Saved Messages): أي entity تمرره لها يتحول داخليًا
+# لنوع خاص (InputPeerSelf) يفشل بخطأ TypeError جوا آلية تتبعها الداخلية،
+# بغض النظر عن طريقة استخدامنا لها. الحل: نبني آلية انتظار يدوية بسيطة
+# عبر asyncio.Future، ونلتقط رد المستخدم من نفس handle_message العام
+# (بما إن الاستخدام شخصي وسؤال واحد بس يكون مفتوح بأي لحظة، متغير
+# وحيد كافٍ بدون تعقيد إضافي).
+pending_quality_future: "asyncio.Future | None" = None
+pending_quality_options: dict = {}
 
 
 def generate_thumbnail(filepath: str):
@@ -193,10 +202,18 @@ async def safe_edit(status_msg, text: str):
 @client.on(events.NewMessage(outgoing=True, chats="me", pattern=r"(?i)^(الغاء|إلغاء|cancel|stop)$"))
 async def handle_cancel(event):
     """يلغي كل التحميلات الجارية حاليًا (لو فيه أكثر من رابط قيد
-    المعالجة). يشتغل بس لو الرسالة عبارة عن كلمة إلغاء فقط، عشان ما
-    يتعارض مع رسائل عادية فيها كلمة "الغاء" ضمن سياق ثاني."""
+    المعالجة)، وكمان يلغي سؤال اختيار جودة مفتوح حاليًا لو فيه واحد.
+    يشتغل بس لو الرسالة عبارة عن كلمة إلغاء فقط، عشان ما يتعارض مع
+    رسائل عادية فيها كلمة "الغاء" ضمن سياق ثاني."""
+    global pending_quality_future
+    cancelled_quality = False
+    if pending_quality_future is not None and not pending_quality_future.done():
+        pending_quality_future.set_result("cancelled")
+        cancelled_quality = True
+
     if not active_operations:
-        await event.respond("ℹ️ ما فيه أي تحميل جارٍ حاليًا لإلغائه.")
+        if not cancelled_quality:
+            await event.respond("ℹ️ ما فيه أي تحميل جارٍ حاليًا لإلغائه.")
         return
 
     count = len(active_operations)
@@ -369,7 +386,33 @@ async def handle_message(event):
     """يستمع فقط لرسائلك أنت في محادثة Saved Messages.
     يدعم أكثر من رابط بنفس الرسالة - يعالجهم واحدًا تلو الآخر.
     يدعم تحديد جودة اختيارية (رقم بعد الرابط، مثل 720 أو 1080)."""
-    text = event.raw_text or ""
+    global pending_quality_future, pending_quality_options
+    text = (event.raw_text or "").strip()
+
+    # لو فيه سؤال اختيار جودة مفتوح حاليًا، أي رد نصي يُعتبر إجابة
+    # عليه (رقم الخيار أو إلغاء)، مو رابط جديد - نتحقق قبل أي شي ثاني.
+    if pending_quality_future is not None and not pending_quality_future.done():
+        if re.match(r"(?i)^(الغاء|إلغاء|cancel)$", text):
+            pending_quality_future.set_result("cancelled")
+            return
+        if text.isdigit():
+            idx = int(text)
+            heights = pending_quality_options.get("heights", [])
+            auto_option = pending_quality_options.get("auto_option")
+            if idx == auto_option:
+                pending_quality_future.set_result(None)
+                return
+            if 1 <= idx <= len(heights):
+                pending_quality_future.set_result(heights[idx - 1])
+                return
+        entity = pending_quality_options.get("entity")
+        auto_option = pending_quality_options.get("auto_option")
+        if entity and auto_option:
+            await client.send_message(
+                entity, f"❌ رقم غير صالح. رد برقم من 1 إلى {auto_option}."
+            )
+        return
+
     urls = URL_REGEX.findall(text)
     if not urls:
         return
@@ -415,11 +458,15 @@ def get_available_heights(url: str) -> list[int]:
 
 
 async def ask_quality_choice(url: str, heights: list[int]):
-    """يعرض قائمة الجودات الحقيقية المتوفرة لهذا الفيديو تحديدًا عبر
-    محادثة تفاعلية (Telethon conversation)، وينتظر رد المستخدم برقم
-    الخيار خلال 60 ثانية.
+    """يعرض قائمة الجودات الحقيقية المتوفرة لهذا الفيديو تحديدًا،
+    وينتظر رد المستخدم برقم الخيار خلال 60 ثانية.
+    بدل client.conversation() (غير متوافقة مع محادثة الحساب مع نفسه)،
+    نرسل السؤال كرسالة عادية، ونفتح asyncio.Future يلتقط الرد من
+    handle_message العام لحظة ما يوصل، بدون انتظار حجب (blocking) هنا.
     يرجّع: الارتفاع المختار (int) - أو None لو اختار "أعلى جودة
     تلقائيًا" أو انتهى الوقت - أو "cancelled" لو ألغى."""
+    global pending_quality_future, pending_quality_options
+
     auto_option = len(heights) + 1
     lines = ["🎚️ اختر جودة هذا الفيديو (رد برقم الخيار):\n"]
     for i, h in enumerate(heights, start=1):
@@ -431,28 +478,23 @@ async def ask_quality_choice(url: str, heights: list[int]):
     prompt = "\n".join(lines)
 
     entity = SELF_ENTITY or await client.get_me()
+    await client.send_message(entity, prompt)
+
+    loop = asyncio.get_event_loop()
+    pending_quality_future = loop.create_future()
+    pending_quality_options = {
+        "heights": heights, "auto_option": auto_option, "entity": entity,
+    }
     try:
-        async with client.conversation(entity, timeout=60) as conv:
-            await conv.send_message(prompt)
-            while True:
-                resp = await conv.get_response()
-                text = (resp.raw_text or "").strip()
-                if re.match(r"(?i)^(الغاء|إلغاء|cancel)$", text):
-                    return "cancelled"
-                if text.isdigit():
-                    idx = int(text)
-                    if idx == auto_option:
-                        return None
-                    if 1 <= idx <= len(heights):
-                        return heights[idx - 1]
-                await conv.send_message(
-                    f"❌ رقم غير صالح. رد برقم من 1 إلى {auto_option}."
-                )
+        return await asyncio.wait_for(pending_quality_future, timeout=60)
     except asyncio.TimeoutError:
         await client.send_message(
-            entity, f"⏰ انتهى الوقت، جاري المتابعة بأعلى جودة تلقائيًا.\n{url}"
+            entity, "⏰ انتهى الوقت، جاري المتابعة بأعلى جودة تلقائيًا."
         )
         return None
+    finally:
+        pending_quality_future = None
+        pending_quality_options = {}
 
 
 async def process_single_url(event, url: str, quality: int | None = None):
