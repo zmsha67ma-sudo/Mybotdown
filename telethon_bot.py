@@ -105,6 +105,12 @@ CANCELLED_MARKER = "USER_CANCELLED_OPERATION"
 BOT_START_TIME = datetime.now()
 stats = {"completed_downloads": 0, "total_bytes_sent": 0, "failed_downloads": 0}
 
+# كيان (entity) حسابك نفسه - نجيبه مرة وحدة بعد بدء تشغيل العميل
+# ونعيد استخدامه، بدل تمرير النص "me" مباشرة لـ client.conversation()
+# اللي يسبب خطأ TypeError (Cannot cast InputPeerSelf to any kind of
+# Peer) بمكتبة Telethon عند بعض النسخ.
+SELF_ENTITY = None
+
 
 def generate_thumbnail(filepath: str):
     """يولّد صورة مصغّرة (thumbnail) عبر ffmpeg فقط - أخف بكثير من قبل
@@ -424,8 +430,9 @@ async def ask_quality_choice(url: str, heights: list[int]):
     )
     prompt = "\n".join(lines)
 
+    entity = SELF_ENTITY or await client.get_me()
     try:
-        async with client.conversation("me", timeout=60) as conv:
+        async with client.conversation(entity, timeout=60) as conv:
             await conv.send_message(prompt)
             while True:
                 resp = await conv.get_response()
@@ -443,7 +450,7 @@ async def ask_quality_choice(url: str, heights: list[int]):
                 )
     except asyncio.TimeoutError:
         await client.send_message(
-            "me", f"⏰ انتهى الوقت، جاري المتابعة بأعلى جودة تلقائيًا.\n{url}"
+            entity, f"⏰ انتهى الوقت، جاري المتابعة بأعلى جودة تلقائيًا.\n{url}"
         )
         return None
 
@@ -710,6 +717,8 @@ async def main():
 
     await start_health_server()
     await client.start()
+    global SELF_ENTITY
+    SELF_ENTITY = await client.get_me()
     logger.info("البوت (Telethon) يعمل الآن... أرسل رابطًا في Saved Messages")
     await client.run_until_disconnected()
 
