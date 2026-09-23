@@ -6,10 +6,14 @@
 - افتح محادثة "Saved Messages" (رسائلي المحفوظة) في تيلجرام.
 - أرسل رابط فيديو من X أو أي موقع مدعوم.
 - البوت يحمّله ويرسله لك بأعلى جودة متوفرة بالموقع ضمن حد 2 جيجا.
-- لو تبي جودة محددة، أضف الرقم بعد الرابط بنفس الرسالة، مثال:
+- لو تبي جودة محددة مسبقًا، أضف الرقم بعد الرابط بنفس الرسالة، مثال:
   https://x.com/xxx/status/123 720
   (الأرقام المدعومة: 240, 360, 480, 720, 1080, 1440, 2160)
-  لو ما حددت رقم، يحمّل أعلى جودة موجودة تلقائيًا.
+  بهالحالة يبدأ التحميل فورًا بدون أي سؤال.
+- لو ما حددت رقم، البوت يجيب أولاً قائمة الجودات المتوفرة فعليًا
+  لهذا الفيديو تحديدًا (استعلام خفيف جدًا، بدون تحميل أي بايت من
+  الفيديو نفسه) ويسألك تختار بالرد برقم الخيار خلال 60 ثانية. لو ما
+  رديت بالوقت، يكمل تلقائيًا بأعلى جودة.
 - لإلغاء أي تحميل جارٍ، أرسل كلمة: الغاء (أو إلغاء أو cancel)
 - لمسح أي ملفات مؤقتة متراكمة من عمليات سابقة، أرسل: تنظيف (أو مسح الكاش)
 - لإعادة تشغيل السيرفر بالكامل، أرسل: اعادة تشغيل (أو restart)
@@ -338,8 +342,11 @@ async def handle_help(event):
     """يعرض قائمة كل الأوامر المتاحة بالبوت."""
     text = (
         "🤖 **قائمة أوامر البوت**\n\n"
-        "📥 أرسل أي رابط فيديو → يحمّله ويرسله لك تلقائيًا\n"
-        "🎚️ أضف رقم جودة بعد الرابط (مثل: 720) → يحمّل بتلك الجودة\n\n"
+        "📥 أرسل أي رابط فيديو بدون رقم → يسألك تختار الجودة من قائمة "
+        "الجودات الحقيقية المتوفرة لهذا الفيديو (أو انتظر 60 ثانية "
+        "ليكمل تلقائيًا بأعلى جودة)\n"
+        "🎚️ أضف رقم جودة بعد الرابط (مثل: 720) → يحمّل بتلك الجودة "
+        "فورًا بدون سؤال\n\n"
         "**أوامر التحكم:**\n"
         "• `الغاء` - يوقف أي تحميل شغّال حاليًا\n"
         "• `تنظيف` - يمسح الملفات المؤقتة المتراكمة\n"
@@ -371,9 +378,97 @@ async def handle_message(event):
         await process_single_url(event, url, quality)
 
 
+def build_probe_ydl_opts() -> dict:
+    """نفس إعدادات yt-dlp الأساسية المستخدمة بالتحميل الفعلي (كوكيز +
+    واجهات يوتيوب البديلة)، بدون أي إعداد تحميل - نستخدمها فقط
+    لاستعلام الميتاداتا، عشان قائمة الجودات المعروضة تطابق تمامًا
+    وش يقدر التحميل الفعلي يوصله لاحقًا."""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "skip_download": True,
+        "extractor_args": {
+            "youtube": {"player_client": ["ios", "android", "web"]},
+        },
+    }
+    if COOKIES_FILE_PATH:
+        opts["cookiefile"] = COOKIES_FILE_PATH
+    return opts
+
+
+def get_available_heights(url: str) -> list[int]:
+    """يجيب فقط قائمة الجودات (الارتفاعات) المتوفرة فعليًا لهذا
+    الرابط من الموقع - بدون تحميل أي بايت من الفيديو نفسه. هذا
+    استعلام ميتاداتا خفيف جدًا (yt-dlp أصلاً يسويه قبل أي تحميل
+    عادي)، فما يأثر على سرعة التحميل الفعلي بعده."""
+    with yt_dlp.YoutubeDL(build_probe_ydl_opts()) as ydl:
+        info = ydl.extract_info(url, download=False)
+    formats = info.get("formats") or []
+    return sorted({f.get("height") for f in formats if f.get("height")}, reverse=True)
+
+
+async def ask_quality_choice(url: str, heights: list[int]):
+    """يعرض قائمة الجودات الحقيقية المتوفرة لهذا الفيديو تحديدًا عبر
+    محادثة تفاعلية (Telethon conversation)، وينتظر رد المستخدم برقم
+    الخيار خلال 60 ثانية.
+    يرجّع: الارتفاع المختار (int) - أو None لو اختار "أعلى جودة
+    تلقائيًا" أو انتهى الوقت - أو "cancelled" لو ألغى."""
+    auto_option = len(heights) + 1
+    lines = ["🎚️ اختر جودة هذا الفيديو (رد برقم الخيار):\n"]
+    for i, h in enumerate(heights, start=1):
+        lines.append(f"{i}. {h}p")
+    lines.append(f"{auto_option}. أعلى جودة تلقائيًا (Auto)")
+    lines.append(
+        "\n(60 ثانية قبل ما نكمل تلقائيًا بأعلى جودة، أو أرسل \"الغاء\" للتجاهل)"
+    )
+    prompt = "\n".join(lines)
+
+    try:
+        async with client.conversation("me", timeout=60) as conv:
+            await conv.send_message(prompt)
+            while True:
+                resp = await conv.get_response()
+                text = (resp.raw_text or "").strip()
+                if re.match(r"(?i)^(الغاء|إلغاء|cancel)$", text):
+                    return "cancelled"
+                if text.isdigit():
+                    idx = int(text)
+                    if idx == auto_option:
+                        return None
+                    if 1 <= idx <= len(heights):
+                        return heights[idx - 1]
+                await conv.send_message(
+                    f"❌ رقم غير صالح. رد برقم من 1 إلى {auto_option}."
+                )
+    except asyncio.TimeoutError:
+        await client.send_message(
+            "me", f"⏰ انتهى الوقت، جاري المتابعة بأعلى جودة تلقائيًا.\n{url}"
+        )
+        return None
+
+
 async def process_single_url(event, url: str, quality: int | None = None):
     """يحمّل رابط واحد ويرسله، مع تحديث حي لنسبة التقدم بنفس الرسالة.
-    quality: أعلى ارتفاع مسموح (مثل 720)، أو None لأعلى جودة متوفرة."""
+    quality: أعلى ارتفاع مسموح (مثل 720)، أو None لأعلى جودة متوفرة
+    (لو None، يسأل المستخدم أولاً عن الجودات الحقيقية المتوفرة - إلا
+    لو فيه جودة وحدة بس متوفرة، بهالحالة ما فيه داعي نسأل)."""
+    if quality is None:
+        try:
+            heights = await asyncio.to_thread(get_available_heights, url)
+        except Exception:
+            logger.exception(
+                "تعذر جلب قائمة الجودات المتوفرة - سيتم المتابعة بأعلى جودة تلقائيًا"
+            )
+            heights = []
+
+        if len(heights) > 1:
+            choice = await ask_quality_choice(url, heights)
+            if choice == "cancelled":
+                await event.respond(f"🛑 تم تجاهل هذا الرابط.\n{url}")
+                return
+            quality = choice  # None يعني أعلى جودة تلقائيًا (بدون تغيير)
+
     quality_label = f" (جودة {quality}p)" if quality else ""
     status = await event.respond(
         f"⏳ جاري التحميل...{quality_label} 0%\n{url}\n\n"
