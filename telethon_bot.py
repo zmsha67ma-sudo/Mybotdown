@@ -30,6 +30,13 @@
 المقيد بعمر):
 - COOKIES_B64: محتوى ملف cookies.txt مُرمّز بصيغة Base64 (راجع README
   لطريقة تصديره من المتصفح وترميزه)
+
+متغير بيئة اختياري ثاني (للتعامل مع البوت من أرقامك الأخرى):
+- GROUP_CHAT_ID: معرّف مجموعة خاصة (رقم صحيح مثل -1001234567890) تضم
+  حسابك اللي شغّل عليه البوت + أرقامك الثانية. لو مضبوط، أي رابط يوصل
+  بهذي المجموعة من أي رقم فيها يُعامل بنفس طريقة Saved Messages تمامًا
+  (تحميل، قائمة جودة، أوامر تحكم). استخدم get_group_id.py لإيجاد
+  الرقم الصحيح بعد ما تسوي المجموعة وتضيف لها الأرقام.
 """
 
 import asyncio
@@ -69,6 +76,23 @@ SESSION_STRING = os.environ.get("SESSION_STRING", "")
 PORT = int(os.environ.get("PORT", "10000"))
 COOKIES_B64 = os.environ.get("COOKIES_B64", "")
 
+# معرّف مجموعة خاصة اختيارية (تضم حسابك اللي شغّل عليه البوت + أرقامك
+# الثانية) - لو مضبوط، البوت يتعامل مع أي رابط يوصل بهذي المجموعة من
+# أي رقم فيها بنفس طريقة تعامله مع Saved Messages. يُقرأ كرقم صحيح
+# (زي -1001234567890)؛ لو ما كان رقم، نتركه نص عادي (يقبل يوزرنيم
+# المجموعة العام لو كانت من هذا النوع).
+_group_env = os.environ.get("GROUP_CHAT_ID", "").strip()
+GROUP_CHAT_ID: "int | str | None" = None
+if _group_env:
+    try:
+        GROUP_CHAT_ID = int(_group_env)
+    except ValueError:
+        GROUP_CHAT_ID = _group_env
+
+# قائمة المحادثات اللي يستمع لها البوت فعليًا بكل المعالجات أدناه:
+# محادثتك مع نفسك (Saved Messages) دايمًا، + المجموعة الخاصة لو انضبطت.
+ALLOWED_CHATS = ["me"] + ([GROUP_CHAT_ID] if GROUP_CHAT_ID else [])
+
 MAX_FILE_SIZE = 2000 * 1024 * 1024  # 2 جيجا
 URL_REGEX = re.compile(r"https?://\S+")
 QUALITY_REGEX = re.compile(r"\b(240|360|480|720|1080|1440|2160)\b")
@@ -85,6 +109,22 @@ MIRROR_DOMAIN_REWRITES = {
     "xvideos-ar.com": "xvideos.com",
     "www.xvideos-ar.com": "www.xvideos.com",
 }
+
+
+def is_allowed_trigger(event) -> bool:
+    """يتحقق إن هذي الرسالة فعليًا مسموح تشغّل البوت منها:
+    - Saved Messages: لازم تكون رسالة "صادرة" منك (out=True) - نفس
+      المنطق القديم (كل رسالة ترسلها لنفسك تعتبر outgoing).
+    - المجموعة الخاصة (GROUP_CHAT_ID): لازم تكون "واردة" (out=False)
+      أي من رقم ثاني غيرك بالمجموعة - هذا يستثني تلقائيًا رسائل حالة/
+      ردود البوت نفسه اللي يرسلها بنفس المجموعة (تطلع out=True لأنها
+      من نفس حسابك اللي شغّل عليه البوت)، فما تسبب تحميل مكرر لو كانت
+      تحتوي رابط بالغلط."""
+    if event.is_private and event.out:
+        return True
+    if GROUP_CHAT_ID and event.chat_id == GROUP_CHAT_ID and not event.out:
+        return True
+    return False
 
 
 def normalize_url(url: str) -> str:
@@ -144,7 +184,11 @@ SELF_ENTITY = None
 # عبر asyncio.Future، ونلتقط رد المستخدم من نفس handle_message العام
 # (بما إن الاستخدام شخصي وسؤال واحد بس يكون مفتوح بأي لحظة، متغير
 # وحيد كافٍ بدون تعقيد إضافي).
-pending_quality_future: "asyncio.Future | None" = None
+# نفس آلية الانتظار اليدوي، بس صارت مفهرسة بمعرّف المحادثة (chat_id)
+# بدل متغير عام واحد - هذا ضروري الآن بعد دعم أكثر من محادثة (Saved
+# Messages + المجموعة الخاصة)، عشان سؤال جودة مفتوح بمحادثة وحدة ما
+# يتعارض مع سؤال ثاني مفتوح بمحادثة ثانية بنفس الوقت.
+pending_quality_futures: dict = {}
 pending_quality_options: dict = {}
 
 
@@ -226,16 +270,18 @@ async def safe_edit(status_msg, text: str):
         logger.exception("خطأ غير متوقع أثناء تعديل الرسالة")
 
 
-@client.on(events.NewMessage(outgoing=True, chats="me", pattern=r"(?i)^(الغاء|إلغاء|cancel|stop)$"))
+@client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=r"(?i)^(الغاء|إلغاء|cancel|stop)$"))
 async def handle_cancel(event):
     """يلغي كل التحميلات الجارية حاليًا (لو فيه أكثر من رابط قيد
     المعالجة)، وكمان يلغي سؤال اختيار جودة مفتوح حاليًا لو فيه واحد.
     يشتغل بس لو الرسالة عبارة عن كلمة إلغاء فقط، عشان ما يتعارض مع
     رسائل عادية فيها كلمة "الغاء" ضمن سياق ثاني."""
-    global pending_quality_future
+    if not is_allowed_trigger(event):
+        return
+    future = pending_quality_futures.get(event.chat_id)
     cancelled_quality = False
-    if pending_quality_future is not None and not pending_quality_future.done():
-        pending_quality_future.set_result("cancelled")
+    if future is not None and not future.done():
+        future.set_result("cancelled")
         cancelled_quality = True
 
     if not active_operations:
@@ -281,11 +327,13 @@ def _clear_leftover_temp_dirs(protected_dirs):
     return removed_count, freed_bytes
 
 
-@client.on(events.NewMessage(outgoing=True, chats="me", pattern=r"(?i)^(تنظيف|مسح الكاش|clean|clear cache)$"))
+@client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=r"(?i)^(تنظيف|مسح الكاش|clean|clear cache)$"))
 async def handle_clean_cache(event):
     """يمسح أي ملفات تحميل مؤقتة متبقية من عمليات سابقة توقفت بشكل
     غير طبيعي (تعطل، انقطاع اتصال، إلخ)، دون التأثير على أي تحميل
     شغّال حاليًا."""
+    if not is_allowed_trigger(event):
+        return
     status = await event.respond("🧹 جاري تنظيف الملفات المؤقتة...")
     protected = {op["tmp_dir"] for op in active_operations}
     removed_count, freed_bytes = await asyncio.to_thread(
@@ -301,12 +349,14 @@ async def handle_clean_cache(event):
         await safe_edit(status, "✅ ما فيه أي ملفات مؤقتة متراكمة - كل شي نظيف.")
 
 
-@client.on(events.NewMessage(outgoing=True, chats="me", pattern=r"(?i)^(اعادة تشغيل|إعادة تشغيل|restart)$"))
+@client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=r"(?i)^(اعادة تشغيل|إعادة تشغيل|restart)$"))
 async def handle_restart(event):
     """يعيد تشغيل السيرفر بالكامل. يوقف العملية الحالية عمدًا، وبما إن
     Render يراقب الخدمة ويعيد تشغيلها تلقائيًا عند توقفها (نفس سلوكه
     مع أي تعطل)، هذا يعادل "إعادة تشغيل" حقيقية بدون حاجة للدخول للوحة
     تحكم Render يدويًا."""
+    if not is_allowed_trigger(event):
+        return
     if active_operations:
         await event.respond(
             f"⚠️ فيه {len(active_operations)} عملية تحميل شغّالة حاليًا. "
@@ -321,20 +371,24 @@ async def handle_restart(event):
     os._exit(0)
 
 
-@client.on(events.NewMessage(outgoing=True, chats="me", pattern=r"(?i)^تأكيد إعادة التشغيل$"))
+@client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=r"(?i)^تأكيد إعادة التشغيل$"))
 async def handle_force_restart(event):
     """تأكيد إعادة التشغيل رغم وجود تحميلات شغّالة - تُفقد هذي
     التحميلات الجارية بدون استكمال."""
+    if not is_allowed_trigger(event):
+        return
     await event.respond("🔄 جاري إعادة التشغيل رغم العمليات الجارية...")
     await asyncio.sleep(1.5)
     os._exit(0)
 
 
-@client.on(events.NewMessage(outgoing=True, chats="me", pattern=r"(?i)^(حالة|status)$"))
+@client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=r"(?i)^(حالة|status)$"))
 async def handle_status(event):
     """يعرض حالة السيرفر الحالية: تحميلات شغّالة، مساحة القرص
     المتبقية، واستهلاك الذاكرة التقريبي - يفيد لتشخيص أي بطء غير
     طبيعي (مثلاً امتلاء القرص أو تراكم ذاكرة)."""
+    if not is_allowed_trigger(event):
+        return
     lines = ["📊 **حالة السيرفر**\n"]
 
     if active_operations:
@@ -367,10 +421,12 @@ async def handle_status(event):
     await event.respond("\n".join(lines))
 
 
-@client.on(events.NewMessage(outgoing=True, chats="me", pattern=r"(?i)^(احصائيات|إحصائيات|stats)$"))
+@client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=r"(?i)^(احصائيات|إحصائيات|stats)$"))
 async def handle_stats(event):
     """يعرض إحصائيات الاستخدام الكلي منذ آخر إعادة تشغيل - يساعدك
     تتابع استهلاكك من حصة Render الشهرية (100 جيجا باندويدث مجانًا)."""
+    if not is_allowed_trigger(event):
+        return
     sent_gb = stats["total_bytes_sent"] / (1024 ** 3)
     percent_of_limit = (sent_gb / 100) * 100  # من أصل 100 جيجا الحصة الشهرية
 
@@ -387,9 +443,11 @@ async def handle_stats(event):
     await event.respond(text)
 
 
-@client.on(events.NewMessage(outgoing=True, chats="me", pattern=r"(?i)^(مساعدة|help)$"))
+@client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=r"(?i)^(مساعدة|help)$"))
 async def handle_help(event):
     """يعرض قائمة كل الأوامر المتاحة بالبوت."""
+    if not is_allowed_trigger(event):
+        return
     text = (
         "🤖 **قائمة أوامر البوت**\n\n"
         "📥 أرسل أي رابط فيديو بدون رقم → يسألك تختار الجودة من قائمة "
@@ -408,35 +466,42 @@ async def handle_help(event):
     await event.respond(text)
 
 
-@client.on(events.NewMessage(outgoing=True, chats="me"))
+@client.on(events.NewMessage(chats=ALLOWED_CHATS))
 async def handle_message(event):
-    """يستمع فقط لرسائلك أنت في محادثة Saved Messages.
+    """يستمع لرسائلك بمحادثة Saved Messages، وكمان (لو مضبوطة)
+    بالمجموعة الخاصة بأرقامك الأخرى - راجع is_allowed_trigger لشرح
+    الفرق بين الحالتين (outgoing مقابل incoming).
     يدعم أكثر من رابط بنفس الرسالة - يعالجهم واحدًا تلو الآخر.
     يدعم تحديد جودة اختيارية (رقم بعد الرابط، مثل 720 أو 1080)."""
-    global pending_quality_future, pending_quality_options
+    if not is_allowed_trigger(event):
+        return
+
+    chat_id = event.chat_id
     text = (event.raw_text or "").strip()
 
-    # لو فيه سؤال اختيار جودة مفتوح حاليًا، أي رد نصي يُعتبر إجابة
-    # عليه (رقم الخيار أو إلغاء)، مو رابط جديد - نتحقق قبل أي شي ثاني.
-    if pending_quality_future is not None and not pending_quality_future.done():
+    # لو فيه سؤال اختيار جودة مفتوح حاليًا **بنفس هذي المحادثة تحديدًا**،
+    # أي رد نصي يُعتبر إجابة عليه (رقم الخيار أو إلغاء)، مو رابط جديد -
+    # نتحقق قبل أي شي ثاني. (سؤال مفتوح بمحادثة ثانية ما يتأثر).
+    future = pending_quality_futures.get(chat_id)
+    if future is not None and not future.done():
+        options = pending_quality_options.get(chat_id, {})
         if re.match(r"(?i)^(الغاء|إلغاء|cancel)$", text):
-            pending_quality_future.set_result("cancelled")
+            future.set_result("cancelled")
             return
         if text.isdigit():
             idx = int(text)
-            heights = pending_quality_options.get("heights", [])
-            auto_option = pending_quality_options.get("auto_option")
+            heights = options.get("heights", [])
+            auto_option = options.get("auto_option")
             if idx == auto_option:
-                pending_quality_future.set_result(None)
+                future.set_result(None)
                 return
             if 1 <= idx <= len(heights):
-                pending_quality_future.set_result(heights[idx - 1])
+                future.set_result(heights[idx - 1])
                 return
-        entity = pending_quality_options.get("entity")
-        auto_option = pending_quality_options.get("auto_option")
-        if entity and auto_option:
+        auto_option = options.get("auto_option")
+        if auto_option:
             await client.send_message(
-                entity, f"❌ رقم غير صالح. رد برقم من 1 إلى {auto_option}."
+                chat_id, f"❌ رقم غير صالح. رد برقم من 1 إلى {auto_option}."
             )
         return
 
@@ -484,16 +549,15 @@ def get_available_heights(url: str) -> list[int]:
     return sorted({f.get("height") for f in formats if f.get("height")}, reverse=True)
 
 
-async def ask_quality_choice(url: str, heights: list[int]):
+async def ask_quality_choice(url: str, heights: list[int], chat_id):
     """يعرض قائمة الجودات الحقيقية المتوفرة لهذا الفيديو تحديدًا،
-    وينتظر رد المستخدم برقم الخيار خلال 60 ثانية.
+    بنفس المحادثة (chat_id) اللي جا منها الرابط - Saved Messages أو
+    المجموعة الخاصة - وينتظر رد المستخدم برقم الخيار خلال 60 ثانية.
     بدل client.conversation() (غير متوافقة مع محادثة الحساب مع نفسه)،
     نرسل السؤال كرسالة عادية، ونفتح asyncio.Future يلتقط الرد من
     handle_message العام لحظة ما يوصل، بدون انتظار حجب (blocking) هنا.
     يرجّع: الارتفاع المختار (int) - أو None لو اختار "أعلى جودة
     تلقائيًا" أو انتهى الوقت - أو "cancelled" لو ألغى."""
-    global pending_quality_future, pending_quality_options
-
     auto_option = len(heights) + 1
     lines = ["🎚️ اختر جودة هذا الفيديو (رد برقم الخيار):\n"]
     for i, h in enumerate(heights, start=1):
@@ -504,24 +568,22 @@ async def ask_quality_choice(url: str, heights: list[int]):
     )
     prompt = "\n".join(lines)
 
-    entity = SELF_ENTITY or await client.get_me()
-    await client.send_message(entity, prompt)
+    await client.send_message(chat_id, prompt)
 
     loop = asyncio.get_event_loop()
-    pending_quality_future = loop.create_future()
-    pending_quality_options = {
-        "heights": heights, "auto_option": auto_option, "entity": entity,
-    }
+    future = loop.create_future()
+    pending_quality_futures[chat_id] = future
+    pending_quality_options[chat_id] = {"heights": heights, "auto_option": auto_option}
     try:
-        return await asyncio.wait_for(pending_quality_future, timeout=60)
+        return await asyncio.wait_for(future, timeout=60)
     except asyncio.TimeoutError:
         await client.send_message(
-            entity, "⏰ انتهى الوقت، جاري المتابعة بأعلى جودة تلقائيًا."
+            chat_id, "⏰ انتهى الوقت، جاري المتابعة بأعلى جودة تلقائيًا."
         )
         return None
     finally:
-        pending_quality_future = None
-        pending_quality_options = {}
+        pending_quality_futures.pop(chat_id, None)
+        pending_quality_options.pop(chat_id, None)
 
 
 async def process_single_url(event, url: str, quality: int | None = None):
@@ -539,7 +601,7 @@ async def process_single_url(event, url: str, quality: int | None = None):
             heights = []
 
         if len(heights) > 1:
-            choice = await ask_quality_choice(url, heights)
+            choice = await ask_quality_choice(url, heights, event.chat_id)
             if choice == "cancelled":
                 await event.respond(f"🛑 تم تجاهل هذا الرابط.\n{url}")
                 return
@@ -725,7 +787,7 @@ async def process_single_url(event, url: str, quality: int | None = None):
         caption = f"{video_title}\n{resolution_note}".strip()
 
         await client.send_file(
-            "me",
+            event.chat_id,
             filename,
             caption=caption,
             supports_streaming=True,
@@ -788,7 +850,13 @@ async def main():
     await client.start()
     global SELF_ENTITY
     SELF_ENTITY = await client.get_me()
-    logger.info("البوت (Telethon) يعمل الآن... أرسل رابطًا في Saved Messages")
+    if GROUP_CHAT_ID:
+        logger.info(
+            f"البوت (Telethon) يعمل الآن... أرسل رابطًا في Saved Messages "
+            f"أو بالمجموعة الخاصة (GROUP_CHAT_ID={GROUP_CHAT_ID})"
+        )
+    else:
+        logger.info("البوت (Telethon) يعمل الآن... أرسل رابطًا في Saved Messages")
     await client.run_until_disconnected()
 
 
