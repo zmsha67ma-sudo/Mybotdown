@@ -58,7 +58,7 @@ except ImportError:
     resource = None
 
 from aiohttp import web
-from telethon import TelegramClient, events, Button
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import DocumentAttributeVideo
 from telethon.errors import FloodWaitError
@@ -109,10 +109,6 @@ MIRROR_DOMAIN_REWRITES = {
     "xvideos-ar.com": "xvideos.com",
     "www.xvideos-ar.com": "www.xvideos.com",
 }
-
-
-AUTO_QUALITY_LABEL = "🔼 أعلى جودة تلقائيًا"
-CANCEL_QUALITY_LABEL = "❌ الغاء"
 
 
 def is_allowed_trigger(event) -> bool:
@@ -489,16 +485,6 @@ async def handle_message(event):
     future = pending_quality_futures.get(chat_id)
     if future is not None and not future.done():
         options = pending_quality_options.get(chat_id, {})
-        label_map = options.get("label_map", {})
-
-        # الحالة الأساسية: المستخدم ضغط أحد الأزرار - نصه يطابق تمامًا
-        # أحد مفاتيح label_map (مثل "720p" أو "🔼 أعلى جودة تلقائيًا").
-        if text in label_map:
-            future.set_result(label_map[text])
-            return
-
-        # توافق مع الطريقة القديمة (كتابة يدوية) لمن يفضّل ما يستخدم
-        # لوحة الأزرار، أو لو الأزرار ما ظهرت بواجهته لأي سبب.
         if re.match(r"(?i)^(الغاء|إلغاء|cancel)$", text):
             future.set_result("cancelled")
             return
@@ -512,8 +498,11 @@ async def handle_message(event):
             if 1 <= idx <= len(heights):
                 future.set_result(heights[idx - 1])
                 return
-
-        await client.send_message(chat_id, "❌ رد غير مفهوم، اضغط أحد الأزرار بالأعلى.")
+        auto_option = options.get("auto_option")
+        if auto_option:
+            await client.send_message(
+                chat_id, f"❌ رقم غير صالح. رد برقم من 1 إلى {auto_option}."
+            )
         return
 
     urls = [normalize_url(u) for u in URL_REGEX.findall(text)]
@@ -563,49 +552,37 @@ def get_available_heights(url: str) -> list[int]:
 async def ask_quality_choice(url: str, heights: list[int], chat_id):
     """يعرض قائمة الجودات الحقيقية المتوفرة لهذا الفيديو تحديدًا،
     بنفس المحادثة (chat_id) اللي جا منها الرابط - Saved Messages أو
-    المجموعة الخاصة - كأزرار ضغط مباشرة (مو أرقام تُكتب يدويًا)،
-    وينتظر رد المستخدم (بالضغط أو حتى بكتابة رقم الخيار يدويًا، دعمًا
-    للطريقة القديمة) خلال 60 ثانية.
-    الأزرار هنا "لوحة مفاتيح مخصّصة" (Reply Keyboard) لا "أزرار Inline"
-    - النوع الوحيد اللي يشتغل فعليًا من حساب شخصي عادي (مو بوت رسمي)،
-    لأن أزرار الـ Inline تحتاج آلية "الرد على الضغطة" (callback) اللي
-    ما تتوفر إلا لحسابات البوت الرسمية عبر Bot API.
+    المجموعة الخاصة - وينتظر رد المستخدم برقم الخيار خلال 60 ثانية.
+    ملاحظة: ما نستخدم أزرار ضغط (Button.text/Inline) لأن تيليجرام
+    يتجاهلها تمامًا (على مستوى السيرفر) لو أُرسلت من حساب مستخدم
+    عادي - هذي الميزة محصورة بحسابات البوت الرسمية عبر @BotFather
+    فقط، بغض النظر عن أي مكتبة تُستخدم (Telethon أو غيرها).
     بدل client.conversation() (غير متوافقة مع محادثة الحساب مع نفسه)،
-    نفتح asyncio.Future يلتقط الرد من handle_message العام لحظة ما
-    يوصل، بدون انتظار حجب (blocking) هنا.
+    نرسل السؤال كرسالة عادية، ونفتح asyncio.Future يلتقط الرد من
+    handle_message العام لحظة ما يوصل، بدون انتظار حجب (blocking) هنا.
     يرجّع: الارتفاع المختار (int) - أو None لو اختار "أعلى جودة
     تلقائيًا" أو انتهى الوقت - أو "cancelled" لو ألغى."""
     auto_option = len(heights) + 1
-    label_map = {f"{h}p": h for h in heights}
-    label_map[AUTO_QUALITY_LABEL] = None
-    label_map[CANCEL_QUALITY_LABEL] = "cancelled"
-
-    # أزرار الجودات نفسها، 3 بكل صف (تلقائي مرتّبة أعلى لأقل)، ثم
-    # صف "تلقائي" وصف "الغاء" لحالهم بالأسفل.
-    height_buttons = [Button.text(f"{h}p", resize=True, single_use=True) for h in heights]
-    button_rows = [height_buttons[i:i + 3] for i in range(0, len(height_buttons), 3)]
-    button_rows.append([Button.text(AUTO_QUALITY_LABEL, resize=True, single_use=True)])
-    button_rows.append([Button.text(CANCEL_QUALITY_LABEL, resize=True, single_use=True)])
-
-    prompt = (
-        "🎚️ اختر جودة هذا الفيديو بالضغط على أحد الأزرار بالأسفل:\n"
-        "(60 ثانية قبل ما نكمل تلقائيًا بأعلى جودة)"
+    lines = ["🎚️ اختر جودة هذا الفيديو (رد برقم الخيار):\n"]
+    for i, h in enumerate(heights, start=1):
+        lines.append(f"{i}. {h}p")
+    lines.append(f"{auto_option}. أعلى جودة تلقائيًا (Auto)")
+    lines.append(
+        "\n(60 ثانية قبل ما نكمل تلقائيًا بأعلى جودة، أو أرسل \"الغاء\" للتجاهل)"
     )
-    await client.send_message(chat_id, prompt, buttons=button_rows)
+    prompt = "\n".join(lines)
+
+    await client.send_message(chat_id, prompt)
 
     loop = asyncio.get_event_loop()
     future = loop.create_future()
     pending_quality_futures[chat_id] = future
-    pending_quality_options[chat_id] = {
-        "heights": heights, "auto_option": auto_option, "label_map": label_map,
-    }
+    pending_quality_options[chat_id] = {"heights": heights, "auto_option": auto_option}
     try:
         return await asyncio.wait_for(future, timeout=60)
     except asyncio.TimeoutError:
         await client.send_message(
-            chat_id,
-            "⏰ انتهى الوقت، جاري المتابعة بأعلى جودة تلقائيًا.",
-            buttons=Button.clear(),
+            chat_id, "⏰ انتهى الوقت، جاري المتابعة بأعلى جودة تلقائيًا."
         )
         return None
     finally:
@@ -630,15 +607,14 @@ async def process_single_url(event, url: str, quality: int | None = None):
         if len(heights) > 1:
             choice = await ask_quality_choice(url, heights, event.chat_id)
             if choice == "cancelled":
-                await event.respond(f"🛑 تم تجاهل هذا الرابط.\n{url}", buttons=Button.clear())
+                await event.respond(f"🛑 تم تجاهل هذا الرابط.\n{url}")
                 return
             quality = choice  # None يعني أعلى جودة تلقائيًا (بدون تغيير)
 
     quality_label = f" (جودة {quality}p)" if quality else ""
     status = await event.respond(
         f"⏳ جاري التحميل...{quality_label} 0%\n{url}\n\n"
-        "(أرسل \"الغاء\" لإيقاف هذا التحميل)",
-        buttons=Button.clear(),
+        "(أرسل \"الغاء\" لإيقاف هذا التحميل)"
     )
 
     tmp_dir = tempfile.mkdtemp(prefix="ytdlp_")
