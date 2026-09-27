@@ -551,6 +551,33 @@ def friendly_error_message(raw_error: str) -> str:
     if any(sig in msg for sig in unavailable_signals):
         return "❌ الفيديو غير متاح - إما محذوف أو خاص أو الرابط غير صحيح."
 
+    # حماية ضد الروبوتات (Cloudflare وأمثاله) - يصعب تجاوزها آليًا وبشكل
+    # عام ما نحاول، فنوضح للمستخدم السبب بدل تكرار المحاولة بلا فائدة
+    bot_protection_signals = [
+        "cloudflare", "unusual traffic", "verify you are human", "captcha",
+        "just a moment", "attention required", "access denied", "403: forbidden",
+        "forbidden",
+    ]
+    if any(sig in msg for sig in bot_protection_signals):
+        return (
+            "🛡️ هذا الموقع يستخدم حماية ضد الروبوتات (Cloudflare أو مشابه) "
+            "يصعب تجاوزها آليًا. جرّب رابط من موقع ثاني أو حمّله يدويًا "
+            "بالمتصفح."
+        )
+
+    # مشاكل شبكة/سيرفر مؤقتة (بطء، ازدحام، حظر مؤقت) - غالبًا تُحل بمجرد
+    # إعادة المحاولة بعد شوي، عكس الحالات الدائمة أعلاه
+    transient_signals = [
+        "timed out", "timeout", "connection reset", "connection aborted",
+        "temporary failure", "try again", "503", "502", "504",
+        "too many requests", "429", "connection refused", "read timed out",
+    ]
+    if any(sig in msg for sig in transient_signals):
+        return (
+            "⏳ مشكلة مؤقتة من طرف السيرفر (بطيء أو مزدحم حاليًا) - جرّب "
+            "إرسال نفس الرابط بعد شوي."
+        )
+
     # أي خطأ ثاني غير معروف: نعرض جزء مختصر بدل النص التقني الكامل
     return f"❌ تعذّر التحميل لسبب غير معروف. (تفاصيل مختصرة: {raw_error[:150]})"
 
@@ -1395,6 +1422,12 @@ async def process_single_url(
         "extractor_args": {
             "youtube": {"player_client": ["ios", "android", "web"]},
         },
+        # إعادة محاولة تلقائية لمشاكل الشبكة المؤقتة (بطء/ازدحام السيرفر)
+        # قبل ما نستسلم ونعرض رسالة فشل - يقلل الحاجة لإعادة الإرسال يدويًا
+        "socket_timeout": 30,
+        "retries": 5,
+        "fragment_retries": 10,
+        "extractor_retries": 3,
     }
 
     if as_audio:
@@ -1612,9 +1645,13 @@ async def process_single_url(
             stats["failed_downloads"] += 1
             await safe_edit(status, f"{friendly_error_message(str(e))}\n{url}")
     except Exception as e:
+        # نفس دالة رسائل yt-dlp الودية تنفع هنا كذلك: أخطاء الشبكة
+        # (اتصال، مهلة، حماية Cloudflare) أحيانًا توصل كاستثناء بايثون
+        # عادي (requests.exceptions.*، socket.timeout) مو كـ
+        # yt_dlp.utils.DownloadError، فنستفيد من نفس الفحص بدل تكراره.
         stats["failed_downloads"] += 1
         logger.exception("خطأ غير متوقع")
-        await safe_edit(status, f"❌ حدث خطأ غير متوقع: {str(e)[:150]}\n{url}")
+        await safe_edit(status, f"{friendly_error_message(str(e))}\n{url}")
     finally:
         if slot_held:
             job_slots.release()
