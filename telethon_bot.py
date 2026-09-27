@@ -158,6 +158,15 @@ for _part in os.environ.get("ALLOWED_USER_IDS", "").replace(";", ",").split(",")
     except ValueError:
         logging.getLogger(__name__).warning(f"رقم غير صالح بـ ALLOWED_USER_IDS: {_part}")
 URL_REGEX = re.compile(r"https?://\S+")
+# رموز تحكم اتجاه النص (Bidi) اللي تيليجرام/لوحة المفاتيح تضيفها تلقائيًا
+# غالبًا لما يختلط عربي وإنجليزي بنفس النص - غير مرئية لكنها تُنسخ فعليًا
+# مع الرابط وتكسره لو انحطت بنص الرابط.
+BIDI_CONTROL_CHARS = re.compile(
+    "[\u200b\u200c\u200d\u200e\u200f\u061c\u202a-\u202e\u2066-\u2069]"
+)
+# علامات ترقيم شائعة تلتصق بنهاية الرابط بدون مسافة (قوس/تنصيص إغلاق،
+# علامات عربية) ومو فعليًا جزء منه
+TRAILING_URL_PUNCT = ".,!?؛،؟\u061f)]}»\u201d\u2019'"
 QUALITY_REGEX = re.compile(r"\b(240|360|480|720|1080|1440|2160)\b")
 # كلمة gif / جيف لوحدها (نبحث عنها بالنص بعد إزالة الروابط، عشان ما
 # تتطابق مع رابط فيه كلمة gif مثل .../funny.gif)
@@ -345,6 +354,15 @@ def is_allowed_trigger(event) -> bool:
             return False
         return True
     return False
+
+
+def clean_url(url: str) -> str:
+    """ينظّف الرابط المُكتشف من رموز التحكم الاتجاهي المخفية (تسبب عدم
+    التعرف على الرابط أو فشل التحميل بصمت لما يختلط عربي/إنجليزي)، ويشيل
+    أي علامة ترقيم ملتصقة بنهايته (قوس إغلاق، نقطة، فاصلة عربية...) مو
+    فعليًا جزء من الرابط."""
+    url = BIDI_CONTROL_CHARS.sub("", url)
+    return url.rstrip(TRAILING_URL_PUNCT)
 
 
 def normalize_url(url: str) -> str:
@@ -1031,7 +1049,7 @@ async def handle_message(event):
         # معالجه الخاص - ما نعتبره جواب خاطئ على السؤال.
         return
 
-    urls = [normalize_url(u) for u in URL_REGEX.findall(text)]
+    urls = [normalize_url(clean_url(u)) for u in URL_REGEX.findall(text)]
     if not urls:
         return
 
