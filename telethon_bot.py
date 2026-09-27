@@ -69,6 +69,7 @@ import collections
 import glob
 import logging
 import os
+import sys
 import re
 import shutil
 import subprocess
@@ -974,6 +975,10 @@ async def handle_uploaded_video(event):
     except UserFacingError as e:
         stats["failed_downloads"] += 1
         await safe_edit(status, f"⚠️ {e}")
+    except RecursionError:
+        stats["failed_downloads"] += 1
+        logger.exception("RecursionError أثناء تحويل فيديو مرسل إلى GIF")
+        await safe_edit(status, "❌ حدث خطأ داخلي غير متوقع أثناء التحويل.")
     except RuntimeError as e:
         if str(e) == CANCELLED_MARKER:
             await safe_edit(status, "🛑 تم إلغاء التحويل.")
@@ -1582,6 +1587,17 @@ async def process_single_url(
     except UserFacingError as e:
         stats["failed_downloads"] += 1
         await safe_edit(status, f"⚠️ {e}\n{url}")
+    except RecursionError:
+        # RecursionError فرعي من RuntimeError بايثون - لازم يُلتقط قبله
+        # (وإلا معالج RuntimeError تحته يمسكه برسالة "خطأ غير متوقع" مبهمة
+        # ما توضح إن السبب فعليًا من الموقع نفسه لا من الرابط أو البوت).
+        stats["failed_downloads"] += 1
+        logger.exception("RecursionError - على الأغلب سلسلة إعادة توجيهات طويلة/حلقية بالموقع")
+        await safe_edit(
+            status,
+            "❌ هذا الموقع يستخدم إعادة توجيهات (redirects) كثيرة جدًا أو "
+            f"حلقية، وتعذر التعامل معها.\n{url}",
+        )
     except RuntimeError as e:
         if str(e) == CANCELLED_MARKER:
             await safe_edit(status, f"🛑 تم إلغاء العملية بنجاح.\n{url}")
@@ -1652,6 +1668,14 @@ async def main():
         logger.info("البوت (Telethon) يعمل الآن... أرسل رابطًا في Saved Messages")
     await client.run_until_disconnected()
 
+
+# بعض المواقع تستخدم سلسلة إعادة توجيهات (redirects) طويلة قبل الوصول
+# للفيديو الفعلي، وبعض إصدارات yt-dlp تتعامل معها بشكل تكراري (recursive)
+# داخل urllib - فتتجاوز حد بايثون الافتراضي (1000) وتفشل بـ RecursionError
+# حتى لو السلسلة نفسها صحيحة ومنتهية (مو حلقة لا نهائية فعلية). نرفع الحد
+# عشان نعطي هذي الحالات فرصة تكتمل، مع بقاء حماية ضد التكرار اللانهائي
+# الحقيقي (حد أعلى، مو معطّل بالكامل).
+sys.setrecursionlimit(10_000)
 
 if __name__ == "__main__":
     asyncio.run(main())
