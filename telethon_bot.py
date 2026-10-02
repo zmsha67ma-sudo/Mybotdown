@@ -404,6 +404,21 @@ client = TelegramClient(
 # progress_hook مباشرة. بما إن الاستخدام شخصي (حساب واحد بس)، قائمة
 # بسيطة كافية بدون تعقيد إضافي.
 active_operations = []
+# آخر 10 عمليات انتهت (نجاح/فشل/إلغاء) مع توقيت الانتهاء - يخلي أمر
+# "حالة" يقدر يجاوب "خلصت/فشلت" حتى بعد ما تختفي من active_operations،
+# بدل ما يبين وكأنه ما فيه فرق بين "خلص بنجاح" و"فشل بصمت".
+recent_operations = collections.deque(maxlen=10)
+
+
+def record_finished(op: dict, outcome: str, detail: str = ""):
+    """يسجّل نتيجة عملية انتهت بـ recent_operations. outcome: "done"
+    (نجحت وأُرسلت) / "failed" (خطأ) / "cancelled" (ألغاها المستخدم)."""
+    recent_operations.append({
+        "url": op.get("url", "؟"),
+        "outcome": outcome,
+        "detail": detail,
+        "finished_at": time.monotonic(),
+    })
 CANCELLED_MARKER = "USER_CANCELLED_OPERATION"
 
 # إحصائيات بسيطة تُحفظ بالذاكرة فقط (تصفر عند أي إعادة تشغيل) - تساعدك
@@ -584,13 +599,69 @@ def friendly_error_message(raw_error: str) -> str:
 
 async def safe_edit(status_msg, text: str):
     """يعدّل رسالة الحالة، ويتجاهل أخطاء FloodWaitError (تيلجرام يحد
-    عدد التعديلات المسموحة بفترة قصيرة) بدل ما يفشل العملية كلها."""
+    عدد التعديلات المسموحة بفترة قصيرة) بدل ما يفشل العملية كلها.
+    لو status_msg نفسها None (مثلاً safe_respond فشلت بإنشائها أصلًا
+    بسبب ازدحام)، نتجاهل بصمت بدل كسر الكود بخطأ AttributeError."""
+    if status_msg is None:
+        return
     try:
         await status_msg.edit(text)
     except FloodWaitError as e:
         logger.warning(f"FloodWaitError عند تعديل الرسالة - تجاهلناها ({e.seconds}s)")
     except Exception:
         logger.exception("خطأ غير متوقع أثناء تعديل الرسالة")
+
+
+async def safe_send(chat_id, text: str):
+    """نفس فكرة safe_respond بالضبط، لكن لمواضع ما عندها event (مثل
+    قائمة اختيار الجودة أو جواب رقم غير صالح) وتحتاج ترسل بمعرّف
+    المحادثة (chat_id) مباشرة عبر client.send_message."""
+    try:
+        return await client.send_message(chat_id, text)
+    except FloodWaitError as e:
+        logger.warning(f"FloodWaitError عند الإرسال - {e.seconds}s")
+        if e.seconds <= 60:
+            await asyncio.sleep(e.seconds + 1)
+            try:
+                return await client.send_message(chat_id, text)
+            except Exception:
+                logger.exception("فشل الإرسال حتى بعد الانتظار")
+                return None
+        return None
+    except Exception:
+        logger.exception("خطأ غير متوقع أثناء الإرسال")
+        return None
+
+
+async def safe_respond(event, text: str = ""):
+    """إرسال رسالة جديدة (event.respond) مع تحمّل FloodWaitError بدل ما
+    يكسر المعالج (handler) بالكامل بصمت.
+
+    قبل هذا الإصلاح: أي FloodWaitError من event.respond() مباشر (مو
+    بالتعديل) كان يطلع كـ "Unhandled exception" بسجلات Render ويوقف
+    المعالج قبل ما يرد على المستخدم - يعطي انطباع إن البوت "علّق" أو
+    توقف عن الرد تمامًا، رغم إنه شغّال فعليًا وبس مزدحم مؤقتًا.
+
+    لو الانتظار المطلوب قصير (≤60 ثانية) ننتظر ونعيد المحاولة مرة وحدة؛
+    غير كذا نتنازل ونسجل بالسجلات (الانتظار الطويل يعني تجاهل هذا الرد
+    أفضل من تجميد المحادثة بالكامل). يرجّع الرسالة المُرسلة، أو None لو
+    فشل الإرسال نهائيًا (المستدعي اللي يحتاج .edit() لازم يتحقق من None
+    أول - استخدم safe_edit() اللي أصلًا يتحمّل None بأمان لو زودناها)."""
+    try:
+        return await event.respond(text)
+    except FloodWaitError as e:
+        logger.warning(f"FloodWaitError عند الرد - {e.seconds}s")
+        if e.seconds <= 60:
+            await asyncio.sleep(e.seconds + 1)
+            try:
+                return await event.respond(text)
+            except Exception:
+                logger.exception("فشل الرد حتى بعد الانتظار")
+                return None
+        return None
+    except Exception:
+        logger.exception("خطأ غير متوقع أثناء الرد")
+        return None
 
 
 @client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=r"(?i)^(الغاء|إلغاء|cancel|stop)$"))
@@ -609,14 +680,14 @@ async def handle_cancel(event):
 
     if not active_operations:
         if not cancelled_quality:
-            await event.respond("ℹ️ ما فيه أي تحميل جارٍ حاليًا لإلغائه.")
+            await safe_respond(event, "ℹ️ ما فيه أي تحميل جارٍ حاليًا لإلغائه.")
         return
 
     count = len(active_operations)
     for op in list(active_operations):
         op["cancel_event"].set()
 
-    await event.respond(f"🛑 يتم إلغاء {count} عملية جارية...")
+    await safe_respond(event, f"🛑 يتم إلغاء {count} عملية جارية...")
 
 
 def _clear_leftover_temp_dirs(protected_dirs):
@@ -657,7 +728,7 @@ async def handle_clean_cache(event):
     شغّال حاليًا."""
     if not is_allowed_trigger(event):
         return
-    status = await event.respond("🧹 جاري تنظيف الملفات المؤقتة...")
+    status = await safe_respond(event, "🧹 جاري تنظيف الملفات المؤقتة...")
     protected = {op["tmp_dir"] for op in active_operations}
     removed_count, freed_bytes = await asyncio.to_thread(
         _clear_leftover_temp_dirs, protected
@@ -681,14 +752,14 @@ async def handle_restart(event):
     if not is_allowed_trigger(event):
         return
     if active_operations:
-        await event.respond(
+        await safe_respond(event, 
             f"⚠️ فيه {len(active_operations)} عملية تحميل شغّالة حاليًا. "
             "أرسل \"الغاء\" أول لو تبي توقفها، أو أرسل \"تأكيد إعادة التشغيل\" "
             "للمتابعة رغم ذلك."
         )
         return
 
-    await event.respond("🔄 جاري إعادة تشغيل السيرفر... البوت بيرجع يشتغل خلال دقيقة تقريبًا.")
+    await safe_respond(event, "🔄 جاري إعادة تشغيل السيرفر... البوت بيرجع يشتغل خلال دقيقة تقريبًا.")
     await asyncio.sleep(1.5)  # نضمن وصول الرسالة قبل إيقاف العملية
     logger.info("إعادة تشغيل مطلوبة يدويًا - إيقاف العملية الآن")
     os._exit(0)
@@ -700,26 +771,63 @@ async def handle_force_restart(event):
     التحميلات الجارية بدون استكمال."""
     if not is_allowed_trigger(event):
         return
-    await event.respond("🔄 جاري إعادة التشغيل رغم العمليات الجارية...")
+    await safe_respond(event, "🔄 جاري إعادة التشغيل رغم العمليات الجارية...")
     await asyncio.sleep(1.5)
     os._exit(0)
 
 
-@client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=r"(?i)^(حالة|status)$"))
-async def handle_status(event):
-    """يعرض حالة السيرفر الحالية: تحميلات شغّالة، مساحة القرص
-    المتبقية، واستهلاك الذاكرة التقريبي - يفيد لتشخيص أي بطء غير
-    طبيعي (مثلاً امتلاء القرص أو تراكم ذاكرة)."""
-    if not is_allowed_trigger(event):
-        return
+STAGE_LABELS = {
+    "queued": "🕐 بالطابور",
+    "downloading": "⏳ جاري التحميل",
+    "converting": "🎞️ جاري التحويل",
+    "uploading": "📤 جاري الإرسال",
+}
+OUTCOME_LABELS = {
+    "done": "✅ اكتملت",
+    "failed": "❌ فشلت",
+    "cancelled": "🛑 أُلغيت",
+}
+
+
+def fmt_elapsed(seconds: float) -> str:
+    """مدة قصيرة مقروءة (\"منذ 45 ثانية\" / \"منذ 3 دقائق\")، تُستخدم
+    بأمر \"حالة\" لتوضيح عمر كل عملية (شغّالة أو منتهية حديثًا)."""
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"منذ {seconds} ثانية"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"منذ {minutes} دقيقة"
+    return f"منذ {minutes // 60} ساعة"
+
+
+def build_status_text() -> str:
+    """هذا هو جوهر أمر \"حالة\": يجاوب بالضبط على السؤال اللي يطرحه
+    المستخدم لما يطوّل تحميل - هل هو لسه شغّال (تحميل/تحويل/إرسال،
+    بأي نسبة)، خلص بنجاح، أو فشل بخطأ؟ بدون هذا، أمر \"حالة\" القديم كان
+    يقول بس \"ما فيه تحميل شغّال\" في الحالتين (نجح أو فشل بصمت)،
+    فالمستخدم ما يقدر يميّز بينهم."""
     lines = ["📊 **حالة السيرفر**\n"]
 
     if active_operations:
-        lines.append(f"⏳ تحميلات شغّالة الآن: {len(active_operations)}")
+        lines.append(f"⏳ عمليات شغّالة الآن: {len(active_operations)}")
         for op in active_operations:
-            lines.append(f"  • {op['url'][:60]}")
+            stage = STAGE_LABELS.get(op.get("stage", "downloading"), "⏳ جاري التحميل")
+            percent = op.get("percent", 0.0)
+            elapsed = fmt_elapsed(time.monotonic() - op.get("started", time.monotonic()))
+            percent_note = "" if op.get("stage") == "queued" else f" {percent:.0f}%"
+            lines.append(f"  • {stage}{percent_note} - {op['url'][:60]} ({elapsed})")
     else:
-        lines.append("⏳ ما فيه أي تحميل شغّال حاليًا")
+        lines.append("⏳ ما فيه أي عملية شغّالة حاليًا")
+
+    recent = list(recent_operations)[-5:]
+    if recent:
+        lines.append("\n🕓 آخر العمليات المنتهية:")
+        for rec in reversed(recent):
+            outcome = OUTCOME_LABELS.get(rec["outcome"], rec["outcome"])
+            elapsed = fmt_elapsed(time.monotonic() - rec["finished_at"])
+            detail = f" - {rec['detail']}" if rec.get("detail") else ""
+            lines.append(f"  • {outcome} - {rec['url'][:60]} ({elapsed}){detail}")
 
     try:
         disk = shutil.disk_usage(tempfile.gettempdir())
@@ -747,7 +855,18 @@ async def handle_status(event):
     minutes = int((uptime.total_seconds() % 3600) // 60)
     lines.append(f"⏱️ يعمل منذ آخر تشغيل: {hours} ساعة و{minutes} دقيقة")
 
-    await event.respond("\n".join(lines))
+    return "\n".join(lines)
+
+
+@client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=r"(?i)^(الحالة|حالة|الحاله|حاله|status)$"))
+async def handle_status(event):
+    """يعرض حالة السيرفر الحالية: العمليات الشغّالة (تحميل/تحويل/إرسال
+    بالنسبة والوقت)، آخر العمليات المنتهية (نجحت/فشلت/أُلغيت)، مساحة
+    القرص، واستهلاك الذاكرة - يفيد لما تحميل يطوّل وتبي تعرف هل البوت
+    لسه شغّال عليه، خلص، أو واجه خطأ."""
+    if not is_allowed_trigger(event):
+        return
+    await safe_respond(event, build_status_text())
 
 
 @client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=r"(?i)^(احصائيات|إحصائيات|stats)$"))
@@ -769,7 +888,7 @@ async def handle_stats(event):
         "ملاحظة: هذي الأرقام تصفر تلقائيًا عند أي إعادة تشغيل للسيرفر "
         "(يدوي أو تلقائي من Render)، فهي تقريبية وليست دقيقة 100% لكامل الشهر."
     )
-    await event.respond(text)
+    await safe_respond(event, text)
 
 
 @client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=r"(?i)^(مساعدة|help)$"))
@@ -778,8 +897,8 @@ async def handle_help(event):
     الإعدادات الحالية ومتغيرات البيئة اللي تغيّرها من Render (رسالة ثانية)."""
     if not is_allowed_trigger(event):
         return
-    await event.respond(build_help_text())
-    await event.respond(build_settings_text())
+    await safe_respond(event, build_help_text())
+    await safe_respond(event, build_settings_text())
 
 
 def build_help_text() -> str:
@@ -811,7 +930,9 @@ def build_help_text() -> str:
         "• `الغاء` - يوقف أي تحميل شغّال أو ينتظر بالطابور\n"
         "• `تنظيف` - يمسح الملفات المؤقتة المتراكمة\n"
         "• `اعادة تشغيل` - يعيد تشغيل السيرفر بالكامل\n"
-        "• `حالة` - حالة السيرفر (تحميلات، طابور، قرص، ذاكرة)\n"
+        "• `حالة` (أو `الحالة`/`حاله`) - تحميلات شغّالة بنسبتها الحية "
+        "(تحميل/تحويل/إرسال)، آخر العمليات المنتهية (نجحت/فشلت/أُلغيت)، "
+        "طابور، قرص، ذاكرة\n"
         "• `احصائيات` - إجمالي الاستخدام منذ آخر تشغيل\n"
         "• `مساعدة` - يعرض هذي القائمة"
     )
@@ -857,7 +978,7 @@ async def handle_gif_mode_on(event):
     if not is_allowed_trigger(event):
         return
     touch_gif_mode(event.chat_id)
-    await event.respond(
+    await safe_respond(event, 
         "🎞️ **وضع GIF مفعّل**\n"
         "أرسل الفيديو (أو رابط فيديو) وأحوّله إلى GIF.\n"
         "للخروج والرجوع لتحميل الروابط العادي: `الغاء gif`\n"
@@ -873,9 +994,9 @@ async def handle_gif_mode_off(event):
     was_on = is_gif_mode(event.chat_id)
     gif_mode_until.pop(event.chat_id, None)
     if was_on:
-        await event.respond("✅ تم الخروج من وضع GIF - رجعنا لتحميل الروابط العادي.")
+        await safe_respond(event, "✅ تم الخروج من وضع GIF - رجعنا لتحميل الروابط العادي.")
     else:
-        await event.respond("ℹ️ وضع GIF مو مفعّل أصلاً - أنت بالوضع العادي.")
+        await safe_respond(event, "ℹ️ وضع GIF مو مفعّل أصلاً - أنت بالوضع العادي.")
 
 
 @client.on(events.NewMessage(chats=ALLOWED_CHATS))
@@ -912,7 +1033,7 @@ async def handle_uploaded_video(event):
     # الوصف عشان الـ GIF الناتج ما يحمل وصف تقني، ويبقى فقط أي نص ثاني كتبته.
     clip, caption_rest = parse_clip_range(caption_no_urls)
     if clip == "bad":
-        await event.respond(
+        await safe_respond(event, 
             "⚠️ مدى القص غير صحيح - النهاية لازم تكون بعد البداية "
             "(مثال: `gif 10-20`)."
         )
@@ -920,7 +1041,7 @@ async def handle_uploaded_video(event):
     caption = re.sub(r"\s+", " ", GIF_REGEX.sub(" ", caption_rest)).strip()
 
     if doc.size and doc.size > GIF_MAX_INPUT_MB * 1024 * 1024:
-        await event.respond(
+        await safe_respond(event, 
             f"⚠️ الفيديو أكبر من {GIF_MAX_INPUT_MB} ميجا، تعذر تحويله إلى GIF."
         )
         return
@@ -932,24 +1053,30 @@ async def handle_uploaded_video(event):
     width = int(vattr.w) if vattr and vattr.w else 0
     height = int(vattr.h) if vattr and vattr.h else 0
 
-    status = await event.respond("🎞️ جاري تحويل الفيديو إلى GIF...\n(أرسل \"الغاء\" للإيقاف)")
+    status = await safe_respond(event, "🎞️ جاري تحويل الفيديو إلى GIF...\n(أرسل \"الغاء\" للإيقاف)")
     tmp_dir = tempfile.mkdtemp(prefix="ytdlp_")
     cancel_event = threading.Event()
     operation = {
         "cancel_event": cancel_event,
         "url": "فيديو مرسل ← GIF",
         "tmp_dir": tmp_dir,
+        "stage": "queued",
+        "percent": 0.0,
+        "started": time.monotonic(),
     }
     active_operations.append(operation)
 
     def download_progress(current: int, total: int):
         if cancel_event.is_set():
             raise RuntimeError(CANCELLED_MARKER)
+        if total:
+            operation["percent"] = current / total * 100
 
     slot_held = False
     try:
         waited = await acquire_job_slot(status, "فيديو مرسل ← GIF", cancel_event)
         slot_held = True
+        operation["stage"] = "downloading"
         if waited:
             await safe_edit(status, "🎞️ جاري تحويل الفيديو إلى GIF...")
         src_path = await client.download_media(
@@ -958,6 +1085,8 @@ async def handle_uploaded_video(event):
         if not src_path or not os.path.exists(src_path):
             raise FileNotFoundError("تعذر تنزيل الفيديو")
 
+        operation["stage"] = "converting"
+        operation["percent"] = 0.0
         win_start, gif_length = resolve_gif_window(clip, duration)
         gif_path = await asyncio.to_thread(
             convert_to_gif, src_path, win_start, gif_length
@@ -975,6 +1104,7 @@ async def handle_uploaded_video(event):
             height = int(round(height * GIF_MAX_WIDTH / width / 2) * 2) if height else 0
             width = GIF_MAX_WIDTH
 
+        operation["stage"] = "uploading"
         thumb_path = await asyncio.to_thread(generate_thumbnail, gif_path)
         await send_bot_file(
             event.chat_id,
@@ -995,27 +1125,34 @@ async def handle_uploaded_video(event):
         )
         stats["completed_downloads"] += 1
         stats["total_bytes_sent"] += os.path.getsize(gif_path)
-        try:
-            await status.delete()
-        except FloodWaitError:
-            pass
+        record_finished(operation, "done")
+        if status is not None:
+            try:
+                await status.delete()
+            except FloodWaitError:
+                pass
     except UserFacingError as e:
         stats["failed_downloads"] += 1
+        record_finished(operation, "failed", str(e)[:150])
         await safe_edit(status, f"⚠️ {e}")
     except RecursionError:
         stats["failed_downloads"] += 1
         logger.exception("RecursionError أثناء تحويل فيديو مرسل إلى GIF")
+        record_finished(operation, "failed", "إعادة توجيهات/تكرار غير طبيعي")
         await safe_edit(status, "❌ حدث خطأ داخلي غير متوقع أثناء التحويل.")
     except RuntimeError as e:
         if str(e) == CANCELLED_MARKER:
+            record_finished(operation, "cancelled")
             await safe_edit(status, "🛑 تم إلغاء التحويل.")
         else:
             stats["failed_downloads"] += 1
             logger.exception("فشل تحويل فيديو مرسل إلى GIF")
+            record_finished(operation, "failed", str(e)[:150])
             await safe_edit(status, f"❌ تعذر تحويل الفيديو إلى GIF: {str(e)[:150]}")
     except Exception as e:
         stats["failed_downloads"] += 1
         logger.exception("خطأ غير متوقع أثناء تحويل فيديو مرسل إلى GIF")
+        record_finished(operation, "failed", str(e)[:150])
         await safe_edit(status, f"❌ حدث خطأ غير متوقع: {str(e)[:150]}")
     finally:
         if slot_held:
@@ -1065,13 +1202,13 @@ async def handle_message(event):
                 return
             max_option = options.get("max_option", auto_option)
             if max_option:
-                await client.send_message(
+                await safe_send(
                     chat_id, f"❌ رقم غير صالح. رد برقم من 1 إلى {max_option}."
                 )
             return
         if URL_REGEX.search(text):
             # رابط جديد وسؤال الجودة لسه مفتوح - ننبّه بدل ما نتجاهله بصمت
-            await client.send_message(
+            await safe_send(
                 chat_id,
                 "⏳ فيه سؤال جودة مفتوح - جاوبه برقم الخيار أو أرسل \"الغاء\" "
                 "أول، وبعدها أرسل الرابط الجديد.",
@@ -1100,7 +1237,7 @@ async def handle_message(event):
     if as_gif:
         clip, text_no_urls = parse_clip_range(text_no_urls)
         if clip == "bad":
-            await event.respond(
+            await safe_respond(event, 
                 "⚠️ مدى القص غير صحيح - النهاية لازم تكون بعد البداية "
                 "(مثال: `gif 10-20`)."
             )
@@ -1110,7 +1247,7 @@ async def handle_message(event):
     quality = int(quality_match.group(1)) if quality_match else None
 
     if len(urls) > 1:
-        await event.respond(f"📋 لقيت {len(urls)} روابط، رح أعالجهم بالترتيب...")
+        await safe_respond(event, f"📋 لقيت {len(urls)} روابط، رح أعالجهم بالترتيب...")
 
     for url in urls:
         await process_single_url(event, url, quality, as_gif, clip, as_audio)
@@ -1261,7 +1398,7 @@ async def ask_quality_choice(url: str, probe: dict, chat_id):
     )
     prompt = "\n".join(lines)
 
-    await client.send_message(chat_id, prompt)
+    await safe_send(chat_id, prompt)
 
     loop = asyncio.get_event_loop()
     future = loop.create_future()
@@ -1276,7 +1413,7 @@ async def ask_quality_choice(url: str, probe: dict, chat_id):
     try:
         return await asyncio.wait_for(future, timeout=60)
     except asyncio.TimeoutError:
-        await client.send_message(
+        await safe_send(
             chat_id, "⏰ انتهى الوقت، جاري المتابعة بأعلى جودة تلقائيًا."
         )
         return None
@@ -1309,7 +1446,7 @@ async def process_single_url(
         if len(probe["heights"]) > 1:
             choice = await ask_quality_choice(url, probe, event.chat_id)
             if choice == "cancelled":
-                await event.respond(f"🛑 تم تجاهل هذا الرابط.\n{url}")
+                await safe_respond(event, f"🛑 تم تجاهل هذا الرابط.\n{url}")
                 return
             elif choice == "audio":
                 as_audio = True  # اختار 🎵 صوت فقط من القائمة
@@ -1325,7 +1462,7 @@ async def process_single_url(
             quality_label += f" ✂️ {clip[0]}-{clip[1]}"
     elif as_audio:
         quality_label += " 🎵 (صوت فقط)"
-    status = await event.respond(
+    status = await safe_respond(event, 
         f"⏳ جاري التحميل...{quality_label} 0%\n{url}\n\n"
         "(أرسل \"الغاء\" لإيقاف هذا التحميل)"
     )
@@ -1336,7 +1473,14 @@ async def process_single_url(
     loop = asyncio.get_event_loop()
     progress_state = {"last_percent": -100, "last_edit_time": 0.0}
     cancel_event = threading.Event()
-    operation = {"cancel_event": cancel_event, "url": url, "tmp_dir": tmp_dir}
+    operation = {
+        "cancel_event": cancel_event,
+        "url": url,
+        "tmp_dir": tmp_dir,
+        "stage": "queued",
+        "percent": 0.0,
+        "started": time.monotonic(),
+    }
     active_operations.append(operation)
 
     def progress_hook(d):
@@ -1355,6 +1499,7 @@ async def process_single_url(
                 if percent is None:
                     return
 
+                operation["percent"] = percent  # نحدّث كل مرة (أمر "حالة" يقرأها مباشرة)
                 now = time.monotonic()
                 # تحديث فقط لو مرّت 5 ثوانٍ على الأقل من آخر تحديث -
                 # نعتمد على الوقت فقط (مو النسبة) عشان ما تصير دفعة
@@ -1451,6 +1596,7 @@ async def process_single_url(
         # طابور: لو فيه MAX_CONCURRENT_JOBS عمليات شغّالة، ننتظر دورنا
         waited = await acquire_job_slot(status, url, cancel_event)
         slot_held = True
+        operation["stage"] = "downloading"
         if waited:
             await safe_edit(
                 status,
@@ -1458,12 +1604,23 @@ async def process_single_url(
                 "(أرسل \"الغاء\" لإيقاف هذا التحميل)",
             )
 
+        download_started_at = time.time()
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = await asyncio.to_thread(ydl.extract_info, url, download=True)
             filename = ydl.prepare_filename(info)
             if not os.path.exists(filename):
                 base, _ = os.path.splitext(filename)
                 filename = base + ".mp4"
+            if not os.path.exists(filename):
+                # نادرًا، الاسم الفعلي اللي كتبه yt-dlp (بعد الدمج/الترميم
+                # النهائي) يختلف عن توقّع prepare_filename() - نلتقط أحدث
+                # ملف كُتب بمجلد التحميل المؤقت بدل ما نفشل فورًا.
+                candidates = [
+                    f for f in glob.glob(os.path.join(tmp_dir, "*"))
+                    if os.path.isfile(f) and os.path.getmtime(f) >= download_started_at - 2
+                ]
+                if candidates:
+                    filename = max(candidates, key=os.path.getmtime)
 
         if as_audio:
             # بعد التحويل يصير الملف .mp3 (الأصلي يُحذف تلقائيًا)
@@ -1494,6 +1651,8 @@ async def process_single_url(
 
         gif_length = 0
         if as_gif:
+            operation["stage"] = "converting"
+            operation["percent"] = 0.0
             win_start, gif_length = resolve_gif_window(
                 clip, int(info.get("duration") or 0)
             )
@@ -1556,6 +1715,8 @@ async def process_single_url(
             # هذي الخاصية هي اللي تخلي تيليجرام يعرضه كـ GIF متحرك
             attributes = (attributes or []) + [DocumentAttributeAnimated()]
 
+        operation["stage"] = "uploading"
+        operation["percent"] = 0.0
         upload_state = {
             "last_percent": -100,
             "last_edit_time": 0.0,
@@ -1571,6 +1732,7 @@ async def process_single_url(
                 if total <= 0:
                     return
                 percent = current / total * 100
+                operation["percent"] = percent  # نحدّث كل مرة (أمر "حالة" يقرأها مباشرة)
                 now = time.monotonic()
                 # نفس منطق الوقت فقط (مو النسبة) لتفادي دفعات التحديث
                 # السريعة بالملفات الصغيرة اللي ترفع خلال ثوانٍ قليلة
@@ -1612,13 +1774,16 @@ async def process_single_url(
         )
         stats["completed_downloads"] += 1
         stats["total_bytes_sent"] += file_size
-        try:
-            await status.delete()
-        except FloodWaitError:
-            pass
+        record_finished(operation, "done")
+        if status is not None:
+            try:
+                await status.delete()
+            except FloodWaitError:
+                pass
 
     except UserFacingError as e:
         stats["failed_downloads"] += 1
+        record_finished(operation, "failed", str(e)[:150])
         await safe_edit(status, f"⚠️ {e}\n{url}")
     except RecursionError:
         # RecursionError فرعي من RuntimeError بايثون - لازم يُلتقط قبله
@@ -1626,6 +1791,7 @@ async def process_single_url(
         # ما توضح إن السبب فعليًا من الموقع نفسه لا من الرابط أو البوت).
         stats["failed_downloads"] += 1
         logger.exception("RecursionError - على الأغلب سلسلة إعادة توجيهات طويلة/حلقية بالموقع")
+        record_finished(operation, "failed", "إعادة توجيهات/تكرار غير طبيعي بالموقع")
         await safe_edit(
             status,
             "❌ هذا الموقع يستخدم إعادة توجيهات (redirects) كثيرة جدًا أو "
@@ -1633,16 +1799,20 @@ async def process_single_url(
         )
     except RuntimeError as e:
         if str(e) == CANCELLED_MARKER:
+            record_finished(operation, "cancelled")
             await safe_edit(status, f"🛑 تم إلغاء العملية بنجاح.\n{url}")
         else:
             stats["failed_downloads"] += 1
             logger.exception("خطأ غير متوقع")
+            record_finished(operation, "failed", str(e)[:150])
             await safe_edit(status, f"❌ حدث خطأ غير متوقع: {str(e)[:150]}\n{url}")
     except yt_dlp.utils.DownloadError as e:
         if CANCELLED_MARKER in str(e):
+            record_finished(operation, "cancelled")
             await safe_edit(status, f"🛑 تم إلغاء العملية بنجاح.\n{url}")
         else:
             stats["failed_downloads"] += 1
+            record_finished(operation, "failed", friendly_error_message(str(e))[:150])
             await safe_edit(status, f"{friendly_error_message(str(e))}\n{url}")
     except Exception as e:
         # نفس دالة رسائل yt-dlp الودية تنفع هنا كذلك: أخطاء الشبكة
@@ -1651,6 +1821,7 @@ async def process_single_url(
         # yt_dlp.utils.DownloadError، فنستفيد من نفس الفحص بدل تكراره.
         stats["failed_downloads"] += 1
         logger.exception("خطأ غير متوقع")
+        record_finished(operation, "failed", friendly_error_message(str(e))[:150])
         await safe_edit(status, f"{friendly_error_message(str(e))}\n{url}")
     finally:
         if slot_held:
