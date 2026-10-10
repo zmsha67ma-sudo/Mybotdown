@@ -65,7 +65,7 @@
 
 المعاينة (GIF يلخّص الفيديو من بدايته لنهايته بـ 4 مقاطع على الأقل):
 - معاينة: قائمة الأوامر | تفعيل المعاينة / تعطيل المعاينة
-- دقة المعاينة (5 مستويات) | مدة المعاينة (5-180 ثانية أو تلقائي)
+- دقة المعاينة (6 مستويات) | مدة المعاينة (5-180 ثانية أو تلقائي)
 - الرابط معاينة: المعاينة فقط بدون الفيديو
 - الإعدادات تُحفظ بشكل دائم برسالة داخل Saved Messages (لا تحذفها).
 - اختيار ذكي للمقاطع بـ FFmpeg: يتجنب اللقطات السوداء/الثابتة/المكررة
@@ -415,7 +415,17 @@ PREVIEW_LEVELS = {
     3: {"name": "متوسطة", "scale": 0.5, "fps": 20, "crf": 26},
     4: {"name": "أقل من متوسطة", "scale": 0.35, "fps": 16, "crf": 28},
     5: {"name": "ضعيفة", "scale": 0.25, "fps": 12, "crf": 30},
+    # ⚡ الأسرع: قص المقاطع ولصقها بـ -c copy بدون أي إعادة ترميز (ثواني بدل
+    # دقائق على Render المجاني). دقة المعاينة = دقة الملف نفسه، والمقاطع
+    # تبدأ من أقرب إطار مفتاحي قبل الموقع المخطَّط (فقد تزيد مدتها قليلًا).
+    6: {"name": "⚡ سريعة جدًا (بدون إعادة ترميز)", "scale": 1.0, "fps": 0, "crf": 0, "copy": True},
 }
+# لو المصدر مو H.264 (مثل VP9/AV1) ما ينفع نسخه مباشرة لـ mp4 يعرضه تيليجرام،
+# فنرمّزه بدقة هذا المستوى (الأسرع بين مستويات الترميز)
+PREVIEW_COPY_FALLBACK_LEVEL = 5
+# تحميل "الرابط معاينة" بالمستوى السريع: أقل ارتفاع ≥ هذا (النسخ يحافظ على دقة
+# الملف المُحمَّل، فما نحمّل أعلى جودة بلا داعي)
+PREVIEW_COPY_TARGET_HEIGHT = 480
 # الإعدادات الحالية (تُحمَّل من الرسالة المحفوظة وقت التشغيل)
 preview_settings = {"enabled": False, "level": 3, "seconds": 0}  # seconds=0 → تلقائي
 preview_store_msg_id = None
@@ -498,11 +508,24 @@ def preview_scale_factor(level: int, long_side: int = 0, override=None) -> float
 
 
 def pick_preview_download(probe: dict, level: int):
-    """لوضع \"المعاينة فقط\": نحدد أقل صيغة فيديو تكفي لدقة المعاينة
+    """لوضع "المعاينة فقط": نحدد أقل صيغة فيديو تكفي لدقة المعاينة
     المطلوبة (بدل تحميل أعلى جودة كاملة) توفيرًا للباندويدث.
-    يرجّع (format_selector، نسبة التصغير بالنسبة للملف المُحمَّل)."""
-    factor = PREVIEW_LEVELS.get(level, PREVIEW_LEVELS[3])["scale"]
+    يرجّع (format_selector، نسبة التصغير بالنسبة للملف المُحمَّل).
+    المستوى السريع (copy): الدقة = دقة الملف المُحمَّل، فنحمّل أقل ارتفاع
+    ≥ PREVIEW_COPY_TARGET_HEIGHT مع تفضيل H.264 (avc1) لأنه الوحيد اللي ينسخ
+    مباشرة لـ mp4."""
+    params = PREVIEW_LEVELS.get(level, PREVIEW_LEVELS[3])
     heights = sorted(probe.get("heights") or [], reverse=True)
+    if params.get("copy"):
+        if not heights:
+            return "bestvideo[vcodec^=avc1]/bestvideo/best", None
+        candidates = [h for h in heights if h >= PREVIEW_COPY_TARGET_HEIGHT]
+        chosen = min(candidates) if candidates else heights[0]
+        return (
+            f"bestvideo[height<={chosen}][vcodec^=avc1]/bestvideo[height<={chosen}]"
+            f"/best[height<={chosen}]/best"
+        ), None
+    factor = params["scale"]
     if not heights:
         return "bestvideo/best", None
     top = heights[0]
@@ -535,7 +558,7 @@ def probe_media(path: str) -> dict:
             [
                 "ffprobe", "-v", "error", *_remote_input_opts(path),
                 "-select_streams", "v:0",
-                "-show_entries", "stream=width,height:format=duration",
+                "-show_entries", "stream=codec_name,width,height:format=duration",
                 "-of", "json", path,
             ],
             capture_output=True, timeout=30,
@@ -547,6 +570,7 @@ def probe_media(path: str) -> dict:
             "width": _num(stream.get("width"), int),
             "height": _num(stream.get("height"), int),
             "duration": _num(fmt.get("duration"), float),
+            "codec": (stream.get("codec_name") or "").lower(),
         }
     except Exception:
         logger.exception("تعذر قراءة بيانات الملف عبر ffprobe")
@@ -751,9 +775,19 @@ def make_preview(
         except Exception:
             logger.exception("خطأ بالاختيار الذكي للمعاينة - استُخدمت المواقع المخطَّطة")
 
+    params = PREVIEW_LEVELS.get(level, PREVIEW_LEVELS[3])
+    copy_mode = bool(params.get("copy"))
+    copy_fallback = False
+    if copy_mode and info.get("codec") != "h264":
+        # النسخ المباشر ينفع فقط مع H.264؛ غيره (VP9/AV1/HEVC...) نرمّزه
+        # بأسرع مستوى ترميز بدل ما ننتج ملف ما يعرضه تيليجرام
+        logger.info(f"المصدر ({info.get('codec') or 'مجهول'}) مو H.264 - ترميز بدل النسخ المباشر")
+        level = PREVIEW_COPY_FALLBACK_LEVEL
+        params = PREVIEW_LEVELS[level]
+        copy_mode, copy_fallback = False, True
+        scale_override = None
     long_side = max(info.get("width", 0), info.get("height", 0))
     factor = preview_scale_factor(level, long_side, scale_override)
-    params = PREVIEW_LEVELS.get(level, PREVIEW_LEVELS[3])
     # scale بالنسبة المئوية من أبعاد الإطار الفعلية (يشتغل صح مع الفيديو
     # العمودي/المدوّر) مع جعل الأبعاد زوجية (شرط H.264)
     vf = (
@@ -769,8 +803,20 @@ def make_preview(
 
     try:
         for i, (start, length) in enumerate(segments):
-            _run_ffmpeg(
-                [
+            if copy_mode:
+                # نسخ بدون ترميز: -noaccurate_seek يبدأ من أقرب إطار مفتاحي
+                # قبل الموقع بدون إطارات "مخفية" (تضمن لصقًا نظيفًا بدون
+                # قفزات). الثمن: المقطع قد يزيد قليلًا عن الطول المطلوب.
+                cmd = [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    *_remote_input_opts(filepath),
+                    "-noaccurate_seek", "-ss", f"{start:.2f}", "-i", filepath,
+                    "-t", f"{length:.2f}", "-an", "-c:v", "copy",
+                    "-avoid_negative_ts", "make_zero",
+                    seg_paths[i],
+                ]
+            else:
+                cmd = [
                     "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                     *_remote_input_opts(filepath),
                     "-ss", f"{start:.2f}", "-i", filepath,
@@ -778,9 +824,40 @@ def make_preview(
                     "-c:v", "libx264", "-preset", "veryfast",
                     "-crf", str(params["crf"]), "-pix_fmt", "yuv420p",
                     seg_paths[i],
-                ],
-                cancel_event, PREVIEW_SEGMENT_TIMEOUT,
-            )
+                ]
+            _run_ffmpeg(cmd, cancel_event, PREVIEW_SEGMENT_TIMEOUT)
+            if copy_mode and os.path.exists(seg_paths[i]):
+                # المصادر ذات الإطارات المفتاحية المتباعدة (GOP طويل) تنتج مقطعًا
+                # أطول بكثير من المطلوب (يبدأ من المفتاحي السابق). لو زاد الطول
+                # بوضوح، نعيد القص من نفس الإطار المفتاحي بطول مضبوط، فتبقى مدة
+                # المعاينة قريبة من المطلوب بدل ما تتضاعف.
+                seg_dur = probe_media(seg_paths[i]).get("duration") or 0
+                if seg_dur > length * 1.5 + 0.5:
+                    key_t = max(0.0, start - (seg_dur - length)) + 0.15  # تحيّز للأعلى عشان نبقى على نفس المفتاحي
+                    retry_path = seg_paths[i] + ".r.mp4"
+                    try:
+                        _run_ffmpeg(
+                            [
+                                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                                *_remote_input_opts(filepath),
+                                "-noaccurate_seek", "-ss", f"{key_t:.2f}", "-i", filepath,
+                                "-t", f"{length:.2f}", "-an", "-c:v", "copy",
+                                "-avoid_negative_ts", "make_zero",
+                                retry_path,
+                            ],
+                            cancel_event, PREVIEW_SEGMENT_TIMEOUT,
+                        )
+                        if os.path.exists(retry_path) and os.path.getsize(retry_path) > 0:
+                            os.replace(retry_path, seg_paths[i])
+                    except RuntimeError as e:
+                        if str(e) == CANCELLED_MARKER:
+                            raise
+                        logger.warning(f"تعذر ضبط طول مقطع المعاينة (نبقي الأصلي): {str(e)[:100]}")
+                    finally:
+                        try:
+                            os.remove(retry_path)
+                        except OSError:
+                            pass
             if not os.path.exists(seg_paths[i]) or os.path.getsize(seg_paths[i]) == 0:
                 raise RuntimeError("تعذر استخراج أحد مقاطع المعاينة")
             if progress:
@@ -818,6 +895,8 @@ def make_preview(
         "segments": len(segments),
         "adjusted": adjusted,
         "size": os.path.getsize(out_path),
+        "copy": copy_mode,
+        "fallback": copy_fallback,
     }
 
 
@@ -1525,6 +1604,10 @@ async def build_and_send_preview(
             f"\n📥 قُرئ من تيليجرام {format_size(s['fetched'])} من "
             f"{format_size(s['size'])} (بدون تنزيل كامل)"
         )
+    if result.get("copy"):
+        caption += "\n⚡ نسخ مباشر بدون إعادة ترميز"
+    elif result.get("fallback"):
+        caption += "\n⚠️ صيغة الفيديو ما تسمح بالنسخ المباشر (مو H.264) فتم ترميزها بدقة ضعيفة"
     operation["stage"] = "uploading"
     await send_bot_file(
         chat_id,
@@ -1581,7 +1664,9 @@ def build_level_prompt() -> str:
         mark = " ✅ (الحالية)" if num == current else ""
         lines.append(f"{num}. {params['name']}{mark}")
     lines.append(
-        "\n(الدقة نسبة من دقة كل فيديو نفسه، وما تتجاوز دقة الملف المحمّل)"
+        "\n(الدقة نسبة من دقة كل فيديو نفسه، وما تتجاوز دقة الملف المحمّل)\n"
+        "(⚡ المستوى 6: أسرع بكثير - قص ولصق بدون ترميز، بدقة الفيديو الأصلية "
+        "وحجم أكبر، ومدة المقاطع قد تزيد قليلًا)"
     )
     return "\n".join(lines)
 
@@ -2122,7 +2207,7 @@ def build_help_text() -> str:
         "🖼️ **المعاينة** (GIF يلخّص الفيديو من بدايته لنهايته)\n"
         "• `معاينة` → قائمة أوامر المعاينة وحالتها\n"
         "• `تفعيل المعاينة` / `تعطيل المعاينة` → مع كل فيديو يتحمّل أو يُرسل للبوت\n"
-        "• `دقة المعاينة` → اختيار الدقة من 5 مستويات (محفوظة بشكل دائم)\n"
+        "• `دقة المعاينة` → اختيار الدقة من 6 مستويات (محفوظة بشكل دائم)\n"
         f"• `مدة المعاينة` → من {PREVIEW_MIN_SECONDS} إلى {PREVIEW_MAX_SECONDS} ثانية أو تلقائي\n"
         "• `الرابط معاينة` → المعاينة فقط بدون الفيديو\n\n"
         "**أوامر التحكم:**\n"
