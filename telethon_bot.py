@@ -225,6 +225,9 @@ AUDIO_REGEX = re.compile(r"(?i)(?<![\w])(mp3|audio|صوت)(?![\w])")
 # كلمة ترجمة / translate → ترجمة كلام الفيديو للعربية (SRT + فيديو مترجم)
 TRANSLATE_REGEX = re.compile(r"(?i)(?<![\w])(ترجم[ةه]?|translate)(?![\w])")
 TRANSLATE_CMD_PATTERN = r"(?i)^(ترجم[ةه]?|translate)$"
+TRANSLATE_ON_PATTERN = r"(?i)^(تفعيل|تشغيل|فعّل|فعل)\s+(ال)?ترجم[ةه]$"
+TRANSLATE_OFF_PATTERN = r"(?i)^(تعطيل|ايقاف|إيقاف|وقف|عطّل|عطل)\s+(ال)?ترجم[ةه]$"
+TRANSLATE_MENU_PATTERN = r"(?i)^((ال)?ترجم[ةه]\s+(ال)?حال[ةه]|حال[ةه]\s+(ال)?ترجم[ةه]|الترجم[ةه]|الترجمه)$"
 # مدى القص: 10-20 أو 1:30-1:45 (نمنع الالتصاق بـ - أو : أو . أو حرف، عشان
 # التواريخ مثل 2026-09-24 ما تنحسب كمدى قص بالغلط)
 _TIME = r"\d{1,5}(?::\d{1,2}){0,2}"
@@ -429,7 +432,8 @@ PREVIEW_LEVELS = {
     5: {"name": "ضعيفة", "scale": 0.25, "fps": 12, "crf": 30},
 }
 # الإعدادات الحالية (تُحمَّل من الرسالة المحفوظة وقت التشغيل)
-preview_settings = {"enabled": False, "level": 3, "seconds": 0}  # seconds=0 → تلقائي
+# translate = ترجمة تلقائية لكل فيديو (رابط أو مرسل) بدون كتابة كلمة ترجمة (أمر تفعيل الترجمة)
+preview_settings = {"enabled": False, "level": 3, "seconds": 0, "translate": False}  # seconds=0 → تلقائي
 preview_store_msg_id = None
 PREVIEW_STORE_TAG = "#preview_settings"
 # سؤال دقة/مدة مفتوح بانتظار ردك: chat_id -> {"kind": "level"|"seconds", "expires": ...}
@@ -443,6 +447,8 @@ def sanitize_preview_settings(data) -> dict:
         return out
     if isinstance(data.get("enabled"), bool):
         out["enabled"] = data["enabled"]
+    if isinstance(data.get("translate"), bool):
+        out["translate"] = data["translate"]
     try:
         level = int(data.get("level", out["level"]))
         if level in PREVIEW_LEVELS:
@@ -1417,7 +1423,7 @@ async def start_stream_server():
 # ===================== المعاينة: الحفظ الدائم والإرسال والأوامر =====================
 def _preview_store_text() -> str:
     return (
-        "⚙️ إعدادات المعاينة - لا تحذف هذي الرسالة (البوت يحفظ فيها إعداداتك "
+        "⚙️ إعدادات المعاينة والترجمة - لا تحذف هذي الرسالة (البوت يحفظ فيها إعداداتك "
         f"عشان ما تضيع مع إعادة التشغيل) {PREVIEW_STORE_TAG}\n"
         + json.dumps(preview_settings, ensure_ascii=False)
     )
@@ -1742,8 +1748,8 @@ async def handle_uploaded_preview(event):
 
     caption = event.raw_text or ""
     caption_no_urls = URL_REGEX.sub(" ", caption)
-    if TRANSLATE_REGEX.search(caption_no_urls):
-        return  # كلمة ترجمة بالوصف: لها معالجها الخاص (handle_uploaded_translate)
+    if translate_wanted_for_text(event.chat_id, caption_no_urls):
+        return  # الترجمة (بالكلمة أو التلقائية): لها معالجها الخاص (handle_uploaded_translate)
     asked = bool(PREVIEW_REGEX.search(caption_no_urls))
     if not (asked or preview_settings["enabled"]):
         return
@@ -1951,6 +1957,31 @@ async def run_translation_job(
         await safe_send(chat_id, f"ℹ️ {note}")
 
 
+def translate_default_on() -> bool:
+    """هل \"وضع الترجمة التلقائية\" شغّال فعليًا؟ (مفعّل بالأمر + مفتاح Groq مضبوط)."""
+    return bool(preview_settings.get("translate")) and translator.is_configured()
+
+
+def translate_wanted_for_text(chat_id, text_no_urls: str) -> bool:
+    """هل نترجم هذي الرسالة (رابط أو وصف فيديو)؟
+    • كلمة ترجمة صريحة ← نعم دائمًا (حتى لو الميزة معطّلة).
+    • الترجمة التلقائية مفعّلة ← نعم، إلا لو كتبت كلمة أمر ثاني صريحة
+      (gif / mp3 / معاينة)، أو كنت بوضع GIF (وضع مؤقت اخترته بنفسك).
+    • غير ذلك ← لا، والبوت يشتغل بأوامره العادية."""
+    if TRANSLATE_REGEX.search(text_no_urls):
+        return True
+    if not translate_default_on():
+        return False
+    if (
+        GIF_REGEX.search(text_no_urls)
+        or PREVIEW_REGEX.search(text_no_urls)
+        or AUDIO_REGEX.search(text_no_urls)
+        or is_gif_mode(chat_id)
+    ):
+        return False
+    return True
+
+
 async def translate_video_message(event, source_msg):
     """يترجم فيديو (أو ملف صوت) موجود برسالة تيليجرام: ينزّله، يترجمه،
     ويرسل النتيجة كرد عليه."""
@@ -2059,6 +2090,61 @@ async def translate_video_message(event, source_msg):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def build_translate_menu_text() -> str:
+    on = bool(preview_settings.get("translate"))
+    state = "مفعّلة ✅" if on else "معطّلة ⛔"
+    key = "مضبوط ✅" if translator.is_configured() else "غير مضبوط ⛔ (اضبط GROQ_API_KEY)"
+    return (
+        "🌐 **الترجمة للعربية**\n\n"
+        f"• الترجمة التلقائية: {state}\n"
+        f"• مفتاح Groq: {key}\n\n"
+        "**الأوامر:**\n"
+        "• `تفعيل الترجمة` → أي رابط ترسله يُحمَّل ويُترجم تلقائيًا (بدون كتابة \"ترجمة\")، "
+        "وأي فيديو ترسله للبوت يُترجم\n"
+        "• `تعطيل الترجمة` → إيقاف الترجمة التلقائية\n"
+        "• `الرابط ترجمة` / رد بكلمة `ترجمة` على فيديو / فيديو ووصفه `ترجمة` → "
+        "ترجمة لمرة وحدة، تشتغل دائمًا حتى لو الميزة معطّلة\n\n"
+        "**ملاحظات:**\n"
+        "• لو الترجمة التلقائية مفعّلة وكتبت مع الرابط `gif` أو `mp3` أو `معاينة` "
+        "يتنفذ هذا الأمر بدل الترجمة\n"
+        "• وضع GIF (لو مفعّل) له الأولوية على الترجمة التلقائية\n"
+        "• لو الميزة معطّلة، البوت يشتغل بأوامره العادية (تحميل/GIF/mp3/معاينة)\n"
+        "• الإعداد يُحفظ بشكل دائم"
+    )
+
+
+@client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=TRANSLATE_MENU_PATTERN))
+async def handle_translate_menu(event):
+    if not is_allowed_trigger(event):
+        return
+    await safe_respond(event, build_translate_menu_text())
+
+
+@client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=TRANSLATE_ON_PATTERN))
+async def handle_translate_on(event):
+    if not is_allowed_trigger(event):
+        return
+    if not translator.is_configured():
+        await safe_respond(event, "⚠️ ما أقدر أفعّل الترجمة التلقائية: " + translator.SETUP_HINT)
+        return
+    await _apply_preview_setting(
+        event, "translate", True,
+        "تم تفعيل الترجمة - أي رابط ترسله يُحمَّل ويُترجم تلقائيًا، "
+        "وأي فيديو ترسله للبوت يُترجم. (للأوامر الثانية اكتب معه gif أو mp3 أو معاينة)",
+    )
+
+
+@client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=TRANSLATE_OFF_PATTERN))
+async def handle_translate_off(event):
+    if not is_allowed_trigger(event):
+        return
+    await _apply_preview_setting(
+        event, "translate", False,
+        "تم تعطيل الترجمة التلقائية - رجع البوت لأوامره العادية "
+        "(وتقدر تترجم لمرة وحدة بكلمة `ترجمة`).",
+    )
+
+
 @client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=TRANSLATE_CMD_PATTERN))
 async def handle_translate_command(event):
     """رد بكلمة `ترجمة` على أي فيديو بالمحادثة (حتى اللي أرسله البوت نفسه)."""
@@ -2079,7 +2165,8 @@ async def handle_translate_command(event):
 
 @client.on(events.NewMessage(chats=ALLOWED_CHATS))
 async def handle_uploaded_translate(event):
-    """فيديو مرسل ووصفه (caption) فيه كلمة ترجمة → يترجمه."""
+    """فيديو مرسل → يترجمه لو وصفه فيه كلمة ترجمة، أو لو الترجمة التلقائية
+    مفعّلة (ما لم تكتب أمرًا صريحًا ثانيًا: gif / معاينة / وضع GIF)."""
     if not is_allowed_trigger(event):
         return
     msg = event.message
@@ -2090,7 +2177,7 @@ async def handle_uploaded_translate(event):
     if not mime.startswith("video/") or msg.gif or msg.video_note:
         return
     caption_no_urls = URL_REGEX.sub(" ", event.raw_text or "")
-    if not TRANSLATE_REGEX.search(caption_no_urls):
+    if not translate_wanted_for_text(event.chat_id, caption_no_urls):
         return
     await asyncio.sleep(2.5)  # عشان رقم رسالة البوت نفسه (لو هو المرسل) يتسجل أول
     if (event.chat_id, msg.id) in bot_sent_ids:
@@ -2370,6 +2457,9 @@ def build_help_text() -> str:
         "🌐 **ترجمة كلام الفيديو للعربية** (ملف SRT + فيديو مترجم)\n"
         "• `الرابط ترجمة` → يحمّل الفيديو ويترجم كلامه (أي لغة ← عربي) بتوقيت مزامن\n"
         "• رد بكلمة `ترجمة` على أي فيديو بالمحادثة، أو أرسل فيديو ووصفه `ترجمة`\n"
+        "• `تفعيل الترجمة` → كل رابط أو فيديو ترسله يُترجم تلقائيًا بدون كتابة ترجمة\n"
+        "• `تعطيل الترجمة` → رجوع للأوامر العادية (كلمة `ترجمة` تبقى تشتغل لمرة وحدة)\n"
+        "• `الترجمة` → حالة الترجمة وأوامرها\n"
         f"• حتى {translator.MAX_MINUTES} دقيقة للترجمة، ودمجها بالفيديو لغاية "
         f"{translator.BURN_MAX_MINUTES} دقائق (بعدها يرسل ملف SRT فقط)\n"
         "• تحتاج مفتاح مجاني `GROQ_API_KEY` من console.groq.com\n\n"
@@ -2429,6 +2519,8 @@ def build_settings_text() -> str:
         f"• `PREVIEW_STREAM_SMART` = {'مفعّل ✅' if PREVIEW_STREAM_SMART else 'معطّل ⛔'} - "
         "الاختيار الذكي مع البث (يقرأ بيانات أكثر)\n\n"
         "**الترجمة للعربية:**\n"
+        f"• الترجمة التلقائية: {'مفعّلة ✅' if preview_settings.get('translate') else 'معطّلة ⛔'} "
+        "(بالأوامر `تفعيل الترجمة` / `تعطيل الترجمة`، تُحفظ دائمًا)\n"
         f"• `GROQ_API_KEY` = {'مضبوط ✅' if translator.is_configured() else 'غير مضبوط ⛔ (ضروري للترجمة)'}\n"
         f"• `TRANSLATE_MAX_MINUTES` = {translator.MAX_MINUTES} · "
         f"`TRANSLATE_MAX_INPUT_MB` = {translator.MAX_INPUT_MB}\n"
@@ -2492,8 +2584,8 @@ async def handle_uploaded_video(event):
 
     caption = event.raw_text or ""
     caption_no_urls = URL_REGEX.sub(" ", caption)
-    if TRANSLATE_REGEX.search(caption_no_urls):
-        return  # كلمة ترجمة بالوصف: لها معالجها الخاص (handle_uploaded_translate)
+    if translate_wanted_for_text(event.chat_id, caption_no_urls):
+        return  # الترجمة (بالكلمة أو التلقائية): لها معالجها الخاص (handle_uploaded_translate)
     in_mode = is_gif_mode(event.chat_id)
     if not in_mode and not GIF_REGEX.search(caption_no_urls):
         return
@@ -2705,7 +2797,7 @@ async def handle_message(event):
     # كلمة mp3/صوت صريحة تتغلب على وضع GIF (طلب صوت فقط لهذا الرابط)
     # كلمة معاينة/preview = المعاينة فقط بدون الفيديو (تتغلب على gif/mp3)
     # كلمة ترجمة تتغلب على كل شي ثاني (gif/mp3/معاينة) لهذا الرابط
-    as_translate = bool(TRANSLATE_REGEX.search(text_no_urls))
+    as_translate = translate_wanted_for_text(chat_id, text_no_urls)
     as_preview = bool(PREVIEW_REGEX.search(text_no_urls)) and not as_translate
     as_audio = (
         bool(AUDIO_REGEX.search(text_no_urls)) and not as_preview and not as_translate
