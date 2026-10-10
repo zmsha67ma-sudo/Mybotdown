@@ -265,9 +265,12 @@ Messages الأساسي)، وتستقبل الفيديوهات بنفس مكان
 | `TRANSLATE_BURN` | اختياري | 1 | دمج الترجمة بالفيديو (`0` = ملف SRT فقط) |
 | `TRANSLATE_BURN_HEIGHT` | اختياري | 480 | أقصى ارتفاع للفيديو المترجم |
 | `TRANSLATE_BURN_MAX_MINUTES` | اختياري | 10 | أطول فيديو يُدمج فيه النص (الأطول → SRT فقط) |
-| `TRANSLATE_BURN_PRESET` | اختياري | ultrafast | سرعة ترميز x264 (أبطأ = حجم أصغر) |
-| `TRANSLATE_STT_MODEL` / `TRANSLATE_LLM_MODEL` | اختياري | whisper-large-v3-turbo / llama-3.3-70b-versatile | نماذج التفريغ والترجمة |
-| `TRANSLATE_LLM_FALLBACK_MODEL` | اختياري | llama-3.1-8b-instant | نموذج احتياطي لو خلصت حصة الأول |
+| `TRANSLATE_BURN_PRESET` | اختياري | superfast | سرعة ترميز x264 (أبطأ = حجم أصغر؛ `ultrafast` أسرع لكن الحجم أضعاف) |
+| `TRANSLATE_BURN_CRF` | اختياري | 28 | جودة الفيديو المدموج (رقم أكبر = حجم أصغر وجودة أقل) |
+| `TRANSLATE_FONT_PERCENT` | اختياري | 8 | حجم خط الترجمة المدموجة كنسبة % من الضلع القصير للفيديو (كبّره لـ 9 أو 10 لو تبيه أكبر) |
+| `TRANSLATE_SYNC_OFFSET_MS` | اختياري | 0 | إزاحة توقيت الترجمة بالميلي ثانية: سالب (مثل -300) = تظهر أبكر، موجب = أتأخر |
+| `TRANSLATE_STT_MODEL` / `TRANSLATE_LLM_MODEL` | اختياري | whisper-large-v3-turbo / openai/gpt-oss-120b | نماذج التفريغ والترجمة |
+| `TRANSLATE_LLM_FALLBACK_MODEL` | اختياري | openai/gpt-oss-20b | نموذج احتياطي لو خلصت حصة الأول |
 | `TRANSLATE_FONT` | اختياري | Noto Sans Arabic | خط الترجمة المدموجة |
 
 > أي متغير رقمي بقيمة خاطئة (مثل `GIF_MAX_SECONDS=abc`) يُتجاهل مع تحذير

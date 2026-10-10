@@ -15,14 +15,17 @@
 - GROQ_API_KEY: مفتاح مجاني من console.groq.com (بدون بطاقة)
 - TRANSLATE_API_BASE: افتراضي https://api.groq.com/openai/v1
 - TRANSLATE_STT_MODEL: افتراضي whisper-large-v3-turbo
-- TRANSLATE_LLM_MODEL: افتراضي llama-3.3-70b-versatile
-- TRANSLATE_LLM_FALLBACK_MODEL: افتراضي llama-3.1-8b-instant (لو خلصت حصة الأول)
+- TRANSLATE_LLM_MODEL: افتراضي openai/gpt-oss-120b (بدل llama-3.3-70b-versatile اللي أوقفته Groq بتاريخ 2026-08-16)
+- TRANSLATE_LLM_FALLBACK_MODEL: افتراضي openai/gpt-oss-20b (بدل llama-3.1-8b-instant الموقوف؛ يُستخدم لو خلصت حصة الأول)
 - TRANSLATE_MAX_MINUTES: أقصى مدة فيديو للترجمة (افتراضي 30)
 - TRANSLATE_MAX_INPUT_MB: أقصى حجم فيديو مرسل يُنزَّل للترجمة (افتراضي 300)
 - TRANSLATE_BURN: 1/0 دمج الترجمة بالفيديو (افتراضي 1)
 - TRANSLATE_BURN_HEIGHT: أقصى ارتفاع للفيديو المترجم (افتراضي 480)
 - TRANSLATE_BURN_MAX_MINUTES: أقصى مدة لدمج الترجمة بالفيديو (افتراضي 10)
-- TRANSLATE_BURN_PRESET: سرعة ترميز x264 (افتراضي ultrafast)
+- TRANSLATE_BURN_PRESET: سرعة ترميز x264 (افتراضي superfast؛ ultrafast أسرع لكن حجمه أكبر بكثير)
+- TRANSLATE_BURN_CRF: جودة الفيديو المدموج، رقم أكبر = حجم أصغر (افتراضي 28)
+- TRANSLATE_FONT_PERCENT: حجم خط الترجمة المدموجة كنسبة % من الضلع القصير للفيديو (افتراضي 8)
+- TRANSLATE_SYNC_OFFSET_MS: إزاحة توقيت الترجمة بالميلي ثانية لضبط المزامنة (سالب = أبكر، موجب = أتأخر؛ افتراضي 0)
 - TRANSLATE_FONT: خط الترجمة المدموجة (افتراضي Noto Sans Arabic)
 """
 
@@ -71,14 +74,17 @@ def _env_flag(name: str, default: bool) -> bool:
 API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 API_BASE = os.environ.get("TRANSLATE_API_BASE", "https://api.groq.com/openai/v1").strip().rstrip("/")
 STT_MODEL = os.environ.get("TRANSLATE_STT_MODEL", "whisper-large-v3-turbo").strip()
-LLM_MODEL = os.environ.get("TRANSLATE_LLM_MODEL", "llama-3.3-70b-versatile").strip()
-LLM_FALLBACK_MODEL = os.environ.get("TRANSLATE_LLM_FALLBACK_MODEL", "llama-3.1-8b-instant").strip()
+LLM_MODEL = os.environ.get("TRANSLATE_LLM_MODEL", "openai/gpt-oss-120b").strip()
+LLM_FALLBACK_MODEL = os.environ.get("TRANSLATE_LLM_FALLBACK_MODEL", "openai/gpt-oss-20b").strip()
 MAX_MINUTES = _env_int("TRANSLATE_MAX_MINUTES", 30, 1)
 MAX_INPUT_MB = _env_int("TRANSLATE_MAX_INPUT_MB", 300, 1)
 BURN_DEFAULT = _env_flag("TRANSLATE_BURN", True)
 BURN_HEIGHT = _env_int("TRANSLATE_BURN_HEIGHT", 480, 144)
 BURN_MAX_MINUTES = _env_int("TRANSLATE_BURN_MAX_MINUTES", 10, 1)
-BURN_PRESET = os.environ.get("TRANSLATE_BURN_PRESET", "ultrafast").strip() or "ultrafast"
+BURN_PRESET = os.environ.get("TRANSLATE_BURN_PRESET", "superfast").strip() or "superfast"
+BURN_CRF = _env_int("TRANSLATE_BURN_CRF", 28, 18)
+FONT_PERCENT = _env_int("TRANSLATE_FONT_PERCENT", 8, 3)
+SYNC_OFFSET_MS = _env_int("TRANSLATE_SYNC_OFFSET_MS", 0, -10000)
 FONT_NAME = os.environ.get("TRANSLATE_FONT", "Noto Sans Arabic").strip() or "Noto Sans Arabic"
 
 CHUNK_SECONDS = 600          # كل جزء صوت 10 دقائق (≈2.4MB بـ 32kbps، بعيد عن حد 25MB)
@@ -198,6 +204,75 @@ def probe_has_audio(path: str) -> bool:
         return bool((res.stdout or b"").strip())
     except Exception:
         return True  # لو فشل الفحص، نجرّب الاستخراج ونشوف
+
+
+def _to_int(x) -> int:
+    try:
+        return int(float(x))
+    except (TypeError, ValueError):
+        return 0
+
+
+def probe_media(path: str) -> dict:
+    """يرجّع أبعاد الفيديو (بعد تدويره لو فيه rotation) وبت ريت الفيديو والصوت وكودك الصوت.
+    أي قيمة غير معروفة = 0 / فاضي."""
+    info = {"width": 0, "height": 0, "v_bps": 0, "a_codec": "", "a_bps": 0}
+    try:
+        res = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", path],
+            capture_output=True, timeout=30,
+        )
+        data = json.loads((res.stdout or b"{}").decode("utf-8", "ignore") or "{}")
+    except Exception:
+        return info
+    fmt = data.get("format") or {}
+    dur = 0.0
+    try:
+        dur = float(fmt.get("duration") or 0)
+    except (TypeError, ValueError):
+        pass
+    v = a = None
+    for st in data.get("streams") or []:
+        kind = st.get("codec_type")
+        if kind == "video" and v is None and not (st.get("disposition") or {}).get("attached_pic"):
+            v = st
+        elif kind == "audio" and a is None:
+            a = st
+    v_bps = 0
+    if v:
+        w, h = _to_int(v.get("width")), _to_int(v.get("height"))
+        rot = _to_int((v.get("tags") or {}).get("rotate"))
+        for sd in v.get("side_data_list") or []:
+            if "rotation" in sd:
+                rot = _to_int(sd.get("rotation"))
+        if abs(rot) % 180 == 90:
+            w, h = h, w
+        info["width"], info["height"] = w, h
+        v_bps = _to_int(v.get("bit_rate"))
+    if a:
+        info["a_codec"] = (a.get("codec_name") or "").lower()
+        info["a_bps"] = _to_int(a.get("bit_rate"))
+    if not v_bps:
+        total = _to_int(fmt.get("bit_rate"))
+        if not total and dur > 0:
+            total = int(_to_int(fmt.get("size")) * 8 / dur)
+        if total:
+            v_bps = max(0, total - (info["a_bps"] or 128000))
+    info["v_bps"] = v_bps
+    return info
+
+
+def scaled_size(w: int, h: int, limit: int) -> tuple:
+    """نفس حساب فلتر scale بدالة الدمج (الضلع القصير لا يتجاوز limit، أبعاد زوجية)."""
+    if w <= 0 or h <= 0:
+        return 0, 0
+    if w > h:
+        nh = (min(h, limit) // 2) * 2
+        nw = int(round(w * nh / h / 2.0)) * 2
+    else:
+        nw = (min(w, limit) // 2) * 2
+        nh = int(round(h * nw / w / 2.0)) * 2
+    return max(2, nw), max(2, nh)
 
 
 def safe_filename(name: str, default: str = "video") -> str:
@@ -325,36 +400,96 @@ def _with_retries(fn, what: str, cancel_event, attempts: int = 4):
 
 # ------------------------------------------------------------ التفريغ (STT)
 def transcribe_chunk(path: str, cancel_event=None) -> dict:
-    """يرجّع {"language": str, "segments": [{"start","end","text",...}]}."""
+    """يرجّع {"language": str, "segments": [...], "words": [{"word","start","end"}]}.
+    نطلب توقيت الكلمات مع الجمل عشان نضبط بدايات ونهايات الترجمة بدقة."""
     if not API_KEY:
         raise TranslateError(SETUP_HINT)
 
-    def call():
-        body, ctype = _build_multipart(
-            [
+    def make_call(with_words: bool):
+        def call():
+            fields = [
                 ("model", STT_MODEL),
                 ("response_format", "verbose_json"),
                 ("timestamp_granularities[]", "segment"),
-                ("temperature", "0"),
-            ],
-            "file", path,
-        )
-        req = urllib.request.Request(
-            f"{API_BASE}/audio/transcriptions", data=body, method="POST",
-            headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": ctype,
-                     "User-Agent": "telethon-video-bot/1.0"},
-        )
-        return _http(req, timeout=180)
+            ]
+            if with_words:
+                fields.append(("timestamp_granularities[]", "word"))
+            fields.append(("temperature", "0"))
+            body, ctype = _build_multipart(fields, "file", path)
+            req = urllib.request.Request(
+                f"{API_BASE}/audio/transcriptions", data=body, method="POST",
+                headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": ctype,
+                         "User-Agent": "telethon-video-bot/1.0"},
+            )
+            return _http(req, timeout=180)
+        return call
 
-    data = _with_retries(call, "التفريغ الصوتي", cancel_event)
+    try:
+        data = _with_retries(make_call(True), "التفريغ الصوتي", cancel_event)
+    except TranslateError as e:
+        if "(400)" not in str(e):
+            raise
+        logger.warning("التفريغ بتوقيت الكلمات مرفوض - نكمل بتوقيت الجمل فقط")
+        data = _with_retries(make_call(False), "التفريغ الصوتي", cancel_event)
     segs = data.get("segments")
     if not segs and (data.get("text") or "").strip():
         segs = [{"start": 0.0, "end": float(data.get("duration") or 0) or 5.0,
                  "text": data["text"]}]
-    return {"language": data.get("language") or "", "segments": segs or []}
+    return {"language": data.get("language") or "", "segments": segs or [],
+            "words": data.get("words") or []}
 
 
-def clean_segments(raw: list, offset: float = 0.0) -> list:
+def _attach_words(segs: list, words: list, offset: float) -> None:
+    """يضبط بداية/نهاية كل جملة على أول وآخر كلمة فعلية فيها (توقيت الكلمات أدق من الجمل)،
+    ويحفظ توقيت الكلمات لتوزيع الترجمة الطويلة على شاشات بدقة."""
+    if not segs or not words:
+        return
+    ws = []
+    for w in words:
+        try:
+            a = float(w.get("start")) + offset
+            b = float(w.get("end")) + offset
+        except (TypeError, ValueError, AttributeError):
+            continue
+        txt = re.sub(r"\s+", "", str(w.get("word") or ""))
+        if not txt:
+            continue
+        ws.append((a, max(a, b), txt))
+    ws.sort(key=lambda x: x[0])
+    buckets = [[] for _ in segs]
+    j = 0
+    for a, b, txt in ws:
+        mid = (a + b) / 2.0
+        best, best_d = None, 1e9
+        for k in range(max(0, j - 2), len(segs)):
+            seg = segs[k]
+            if mid < seg["start"]:
+                d = seg["start"] - mid
+            elif mid > seg["end"]:
+                d = mid - seg["end"]
+            else:
+                d = 0.0
+            if d < best_d:
+                best, best_d = k, d
+            if seg["start"] > mid and seg["start"] - mid > best_d:
+                break
+        if best is not None and best_d <= 1.5:
+            buckets[best].append((a, b, len(txt)))
+            j = best
+    for seg, bucket in zip(segs, buckets):
+        if not bucket:
+            continue
+        start = min(x[0] for x in bucket)
+        end = max(x[1] for x in bucket)
+        if end - start < 0.2:
+            continue
+        if abs(start - seg["start"]) > 4.0 or abs(end - seg["end"]) > 4.0:
+            continue  # فرق كبير = غالبًا ربط كلمات غلط، نبقي توقيت الجملة
+        seg["start"], seg["end"] = start, end
+        seg["words"] = bucket
+
+
+def clean_segments(raw: list, offset: float = 0.0, words: list = None) -> list:
     """يشيل الهلوسات المعروفة (صمت/تكرار) ويضيف إزاحة الجزء."""
     out = []
     for s in raw or []:
@@ -376,6 +511,7 @@ def clean_segments(raw: list, offset: float = 0.0) -> list:
             out[-1]["end"] = max(out[-1]["end"], end)  # تكرار متتالي → ندمجه
             continue
         out.append({"start": start, "end": end, "text": text})
+    _attach_words(out, words, offset)
     return out
 
 
@@ -525,9 +661,10 @@ LINE_WIDTH = 34      # حرف بالسطر (يناسب شاشة الجوال)
 CUE_LINES = 2
 
 
-def _balanced_lines(part: str) -> list:
+def _balanced_lines(part: str, line_width: int = None) -> list:
     """يقسّم نصًا قصيرًا لسطر أو سطرين متوازنين (بدون سطر يتيم)."""
-    if len(part) <= LINE_WIDTH:
+    lw = line_width or LINE_WIDTH
+    if len(part) <= lw:
         return [part]
     width = -(-len(part) // 2) + 2
     while width < len(part):
@@ -539,10 +676,11 @@ def _balanced_lines(part: str) -> list:
     return [part]
 
 
-def split_text_for_cues(text: str) -> list:
+def split_text_for_cues(text: str, line_width: int = None) -> list:
     """يقسّم النص لعدة شاشات متقاربة الطول، كل شاشة سطر أو سطرين."""
+    lw = line_width or LINE_WIDTH
     text = re.sub(r"\s+", " ", text).strip()
-    max_chars = LINE_WIDTH * CUE_LINES - 6
+    max_chars = max(10, lw * CUE_LINES - 6)
     if len(text) <= max_chars:
         return [text]
     n = -(-len(text) // max_chars)
@@ -558,18 +696,45 @@ def split_text_for_cues(text: str) -> list:
     return parts
 
 
-def build_cues(segments: list) -> list:
-    """يقسّم كل جملة طويلة لعدة شاشات ترجمة (حسب طول النص) بتوقيت متناسب."""
+def _time_at(seg: dict, frac: float, as_end: bool) -> float:
+    """الزمن المقابل لنسبة frac (0..1) من نص الجملة. لو عندنا توقيت الكلمات نستخدمه
+    (يراعي الوقفات وسرعة الكلام)، وإلا توزيع خطي بين بداية الجملة ونهايتها."""
+    frac = min(1.0, max(0.0, frac))
+    words = seg.get("words")
+    if not words:
+        return seg["start"] + (seg["end"] - seg["start"]) * frac
+    if frac <= 0.0:
+        return words[0][0]
+    if frac >= 1.0:
+        return words[-1][1]
+    total = sum(w[2] for w in words) or 1
+    acc = 0.0
+    for ws, we, wl in words:
+        lo, hi = acc / total, (acc + wl) / total
+        if (as_end and lo < frac <= hi) or (not as_end and lo <= frac < hi):
+            return ws + (frac - lo) / max(1e-9, hi - lo) * (we - ws)
+        acc += wl
+    return words[-1][1]
+
+
+def build_cues(segments: list, line_width: int = None) -> list:
+    """يقسّم كل جملة طويلة لعدة شاشات ترجمة (حسب طول النص) بتوقيت مبني على توقيت
+    الكلمات الفعلي، ويطبّق إزاحة المزامنة TRANSLATE_SYNC_OFFSET_MS."""
     cues = []
     for seg in segments:
-        parts = split_text_for_cues(seg["ar"])
+        parts = split_text_for_cues(seg["ar"], line_width)
         total_chars = sum(len(p) for p in parts) or 1
-        start, dur = seg["start"], max(0.3, seg["end"] - seg["start"])
-        pos = start
+        acc = 0
         for part in parts:
-            end = pos + dur * (len(part) / total_chars)
-            cues.append({"start": pos, "end": end, "text": "\n".join(_balanced_lines(part))})
-            pos = end
+            f0 = acc / total_chars
+            acc += len(part)
+            f1 = acc / total_chars
+            start = _time_at(seg, f0, False)
+            end = _time_at(seg, f1, True)
+            if end <= start:
+                end = start + 0.3
+            cues.append({"start": start, "end": end,
+                         "text": "\n".join(_balanced_lines(part, line_width))})
     cues.sort(key=lambda c: c["start"])
     for i, cue in enumerate(cues):
         nxt = cues[i + 1]["start"] if i + 1 < len(cues) else None
@@ -577,6 +742,11 @@ def build_cues(segments: list) -> list:
             cue["end"] = cue["start"] + 0.8
         if nxt is not None and cue["end"] > nxt:
             cue["end"] = max(cue["start"] + 0.2, nxt - 0.02)
+    if SYNC_OFFSET_MS:
+        shift = SYNC_OFFSET_MS / 1000.0
+        for cue in cues:
+            cue["start"] = max(0.0, cue["start"] + shift)
+            cue["end"] = max(cue["start"] + 0.2, cue["end"] + shift)
     return cues
 
 
@@ -596,26 +766,90 @@ def _filter_path(path: str) -> str:
     return p
 
 
-def burn_subtitles(src: str, srt_path: str, out_path: str, height: int, duration: float,
-                   cancel_event=None, progress_cb=None):
-    """يدمج الترجمة بالفيديو (يعيد الترميز). height = أقصى ارتفاع للضلع القصير."""
-    h = max(144, int(height))
-    style = (
-        f"FontName={FONT_NAME},FontSize=16,PrimaryColour=&H00FFFFFF,"
-        "OutlineColour=&H00000000,BackColour=&H80000000,BorderStyle=1,"
-        "Outline=1.5,Shadow=0,Alignment=2,MarginV=14,Bold=1"
-    )
-    vf = (
-        f"scale=w='if(gt(iw,ih),-2,min(iw,{h}))':h='if(gt(iw,ih),min(ih,{h}),-2)',"
-        f"subtitles=filename='{_filter_path(srt_path)}':force_style='{style}'"
-    )
-    cmd = [
-        "ffmpeg", "-y", "-v", "error", "-nostats", "-progress", "pipe:1",
-        "-i", src, "-map", "0:v:0", "-map", "0:a?",
-        "-vf", vf,
-        "-c:v", "libx264", "-preset", BURN_PRESET, "-crf", "27", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", out_path,
+def _ass_time(t: float) -> str:
+    cs = int(round(max(0.0, t) * 100))
+    h, cs = divmod(cs, 360000)
+    m, cs = divmod(cs, 6000)
+    sec, cs = divmod(cs, 100)
+    return f"{h}:{m:02d}:{sec:02d}.{cs:02d}"
+
+
+def write_ass(cues: list, path: str, width: int, height: int, font_px: int, font_name: str) -> None:
+    """يكتب ملف ASS بأبعاد الفيديو الفعلية، فحجم الخط (font_px) بالبكسل بالضبط
+    ونسبته للشاشة ثابتة بغض النظر عن أبعاد الفيديو."""
+    outline = max(2, int(round(font_px * 0.08)))
+    margin_v = max(10, int(round(height * 0.06)))
+    margin_h = max(10, int(round(width * 0.05)))
+    lines = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        f"PlayResX: {width}",
+        f"PlayResY: {height}",
+        "WrapStyle: 0",
+        "ScaledBorderAndShadow: yes",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
+        "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
+        "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        f"Style: Default,{font_name},{font_px},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,"
+        f"-1,0,0,0,100,100,0,0,1,{outline},0,2,{margin_h},{margin_h},{margin_v},-1",  # Encoding=-1: libass يكتشف اتجاه النص (RTL) فتجي الفواصل بمكانها
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
+    for c in cues:
+        text = (c["text"].replace("\\", "/").replace("{", "(").replace("}", ")")
+                .replace("\n", "\\N"))
+        lines.append(
+            f"Dialogue: 0,{_ass_time(c['start'])},{_ass_time(c['end'])},Default,,0,0,0,,{text}"
+        )
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def burn_subtitles(src: str, sub_path: str, out_path: str, height: int, duration: float,
+                   cancel_event=None, progress_cb=None, info: dict = None):
+    """يدمج الترجمة بالفيديو (يعيد الترميز). height = أقصى ارتفاع للضلع القصير.
+    sub_path: ملف .ass (حجم الخط مضبوط بالبكسل) أو .srt (احتياط لو تعذر فحص الأبعاد).
+    الحجم: CRF مع سقف بت ريت مبني على بت ريت الفيديو الأصلي، والصوت يُنسخ لو AAC خفيف،
+    فالناتج ما يتضخم عن الأصل."""
+    info = info or {}
+    h = max(144, int(height))
+    scale = (
+        f"scale=w='if(gt(iw,ih),-2,trunc(min(iw,{h})/2)*2)':"
+        f"h='if(gt(iw,ih),trunc(min(ih,{h})/2)*2,-2)'"
+    )
+    if sub_path.lower().endswith(".ass"):
+        sub_filter = f"ass=filename='{_filter_path(sub_path)}'"
+    else:
+        style = (
+            f"FontName={FONT_NAME},FontSize={int(round(288 * FONT_PERCENT / 100))},"
+            "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H80000000,"
+            "BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=16,Bold=1,Encoding=-1"
+        )
+        sub_filter = f"subtitles=filename='{_filter_path(sub_path)}':force_style='{style}'"
+    vf = f"{scale},{sub_filter}"
+
+    v_args = ["-c:v", "libx264", "-preset", BURN_PRESET, "-crf", str(BURN_CRF),
+              "-pix_fmt", "yuv420p"]
+    v_bps = int(info.get("v_bps") or 0)
+    if v_bps > 0:
+        in_px = int(info.get("width") or 0) * int(info.get("height") or 0)
+        ow, oh = scaled_size(int(info.get("width") or 0), int(info.get("height") or 0), h)
+        ratio = min(1.0, (ow * oh) / in_px) if in_px > 0 and ow and oh else 1.0
+        cap_k = max(120, int(v_bps * ratio * 0.9 / 1000))
+        v_args += ["-maxrate", f"{cap_k}k", "-bufsize", f"{cap_k * 2}k"]
+    a_bps = int(info.get("a_bps") or 0)
+    if info.get("a_codec") == "aac" and 0 < a_bps <= 160000:
+        a_args = ["-c:a", "copy"]
+    else:
+        a_args = ["-c:a", "aac", "-b:a", "80k"]
+    cmd = (
+        ["ffmpeg", "-y", "-v", "error", "-nostats", "-progress", "pipe:1",
+         "-i", src, "-map", "0:v:0", "-map", "0:a?", "-vf", vf]
+        + v_args + a_args + ["-movflags", "+faststart", out_path]
+    )
     err_path = out_path + ".err"
     timeout = max(900, int(duration * 10) + 300)
     with open(err_path, "wb") as errf:
@@ -714,7 +948,7 @@ async def translate_video(src_path: str, work_dir: str, title: str, *, cancel_ev
         res = await asyncio.to_thread(transcribe_chunk, path, cancel_event)
         if not language and res["language"] and res["segments"]:
             language = res["language"]
-        segments.extend(clean_segments(res["segments"], offset))
+        segments.extend(clean_segments(res["segments"], offset, res.get("words")))
     if not segments:
         raise TranslateError("ما لقيت كلام واضح بالفيديو (موسيقى/صمت فقط، أو الصوت ضعيف جدًا).")
     if is_arabic_language(language):
@@ -757,6 +991,20 @@ async def translate_video(src_path: str, work_dir: str, title: str, *, cancel_ev
         )
         return result
     out_path = os.path.join(work_dir, f"{base}.ar.mp4")
+    # نجهّز ملف ASS بأبعاد الفيديو الناتج عشان حجم الخط يكون مضبوط ومقروء
+    info = await asyncio.to_thread(probe_media, src_path)
+    sub_path = srt_path
+    ow, oh = scaled_size(info["width"], info["height"], burn_height)
+    if ow and oh:
+        try:
+            font_px = max(18, int(round(min(ow, oh) * FONT_PERCENT / 100.0)))
+            line_w = max(14, min(LINE_WIDTH, int((ow * 0.90) / (font_px * 0.55))))
+            burn_cues = cues if line_w == LINE_WIDTH else build_cues(segments, line_w)
+            ass_path = os.path.join(work_dir, f"{base}.ar.ass")
+            write_ass(burn_cues, ass_path, ow, oh, font_px, FONT_NAME)
+            sub_path = ass_path
+        except Exception as e:  # احتياط: نرجع لملف SRT لو فشل تجهيز ASS
+            logger.warning(f"تعذر تجهيز ASS ({e}) - نستخدم SRT")
     bstate = {"text": "🎬 جاري دمج الترجمة بالفيديو...", "pct": 60.0}
 
     def b_progress(p):
@@ -766,8 +1014,8 @@ async def translate_video(src_path: str, work_dir: str, title: str, *, cancel_ev
     await report(bstate["text"], 60)
     try:
         await _poll(
-            lambda: burn_subtitles(src_path, srt_path, out_path, burn_height,
-                                   duration or 0.0, cancel_event, b_progress),
+            lambda: burn_subtitles(src_path, sub_path, out_path, burn_height,
+                                   duration or 0.0, cancel_event, b_progress, info),
             bstate, lambda text, pct: report(text, pct),
         )
         result["video_path"] = out_path
