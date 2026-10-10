@@ -55,18 +55,28 @@
 متغيرات بيئة اختيارية إضافية:
 - ALLOWED_USER_IDS: أرقام (user id) مفصولة بفواصل، هي فقط اللي يقدر
   يشغّل البوت من المجموعة الخاصة (get_group_id.py يعرض لك أرقام الأعضاء).
-  لو ما ضبطته، أي عضو بالمجموعة يقدر يشغّل البوت.
+  اختياري: لو ما ضبطته، أي عضو بالمجموعة الخاصة يقدر يشغّل البوت.
 - MAX_CONCURRENT_JOBS: أقصى عدد عمليات (تحميل/تحويل) بنفس الوقت؛ الباقي
   ينتظر بالطابور (الافتراضي 2).
 - MAX_FILE_MB: يفرض حد حجم الملف يدويًا. لو ما ضبطته، البوت يكتشف حسابك
   تلقائيًا: 2000 ميجا للحساب العادي و4000 ميجا لو Telegram Premium.
 - GIF_MODE_TIMEOUT_MIN / GIF_MAX_SECONDS / GIF_MAX_INPUT_MB: إعدادات GIF.
+- PREVIEW_MAX_SIDE / PREVIEW_MAX_INPUT_MB: حدود المعاينة (الباقي بالأوامر).
+
+المعاينة (GIF يلخّص الفيديو من بدايته لنهايته بـ 4 مقاطع على الأقل):
+- معاينة: قائمة الأوامر | تفعيل المعاينة / تعطيل المعاينة
+- دقة المعاينة (5 مستويات) | مدة المعاينة (5-40 ثانية أو تلقائي)
+- الرابط معاينة: المعاينة فقط بدون الفيديو
+- الإعدادات تُحفظ بشكل دائم برسالة داخل Saved Messages (لا تحذفها).
+- اختيار ذكي للمقاطع بـ FFmpeg: يتجنب اللقطات السوداء/الثابتة/المكررة
+  (PREVIEW_SMART_PICK=0 يعطّله).
 """
 
 import asyncio
 import base64
 import collections
 import glob
+import json
 import logging
 import os
 import sys
@@ -92,7 +102,7 @@ from telethon.tl.types import (
     DocumentAttributeAudio,
     DocumentAttributeVideo,
 )
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, MessageNotModifiedError
 import yt_dlp
 
 logging.basicConfig(
@@ -101,24 +111,60 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-API_ID = int(os.environ.get("API_ID", "0"))
+
+def _env_int(name: str, default: int, minimum: "int | None" = None) -> int:
+    """يقرأ متغير بيئة رقمي بأمان: قيمة غير صالحة (أو أقل من الحد الأدنى)
+    تُتجاهل مع تحذير بالسجلات ويُستخدم الافتراضي، بدل ما يتعطل البوت
+    كله عند التشغيل بـ ValueError."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(f"قيمة {name} غير صالحة ({raw!r}) - استُخدم الافتراضي {default}")
+        return default
+    if minimum is not None and value < minimum:
+        logger.warning(f"قيمة {name} أقل من الحد الأدنى {minimum} - استُخدم الافتراضي {default}")
+        return default
+    return value
+
+
+API_ID = _env_int("API_ID", 0)
 API_HASH = os.environ.get("API_HASH", "")
 SESSION_STRING = os.environ.get("SESSION_STRING", "")
-PORT = int(os.environ.get("PORT", "10000"))
+PORT = _env_int("PORT", 10000, 1)
 COOKIES_B64 = os.environ.get("COOKIES_B64", "")
+
+# أرقام المستخدمين (user id) المسموح لهم بتشغيل البوت من المجموعة الخاصة
+# (اختياري). فاضي = أي عضو بالمجموعة يقدر يشغّل البوت (مناسب لمجموعة خاصة
+# فيها أرقامك فقط).
+ALLOWED_USER_IDS: set = set()
+for _part in os.environ.get("ALLOWED_USER_IDS", "").replace(";", ",").split(","):
+    _part = _part.strip()
+    if not _part:
+        continue
+    try:
+        ALLOWED_USER_IDS.add(int(_part))
+    except ValueError:
+        logging.getLogger(__name__).warning(f"رقم غير صالح بـ ALLOWED_USER_IDS: {_part}")
 
 # معرّف مجموعة خاصة اختيارية (تضم حسابك اللي شغّل عليه البوت + أرقامك
 # الثانية) - لو مضبوط، البوت يتعامل مع أي رابط يوصل بهذي المجموعة من
-# أي رقم فيها بنفس طريقة تعامله مع Saved Messages. يُقرأ كرقم صحيح
-# (زي -1001234567890)؛ لو ما كان رقم، نتركه نص عادي (يقبل يوزرنيم
-# المجموعة العام لو كانت من هذا النوع).
+# أي رقم فيها بنفس طريقة Saved Messages.
+# رقم صحيح فقط (مثل -1001234567890): القيم النصّية (username) لا تُدعم
+# لأن مقارنتها مع event.chat_id ما تنجح أصلًا.
 _group_env = os.environ.get("GROUP_CHAT_ID", "").strip()
-GROUP_CHAT_ID: "int | str | None" = None
+GROUP_REQUESTED = bool(_group_env)
+GROUP_CHAT_ID: "int | None" = None
 if _group_env:
     try:
         GROUP_CHAT_ID = int(_group_env)
     except ValueError:
-        GROUP_CHAT_ID = _group_env
+        logging.getLogger(__name__).error(
+            "GROUP_CHAT_ID لازم يكون رقمًا صحيحًا (مثل -1001234567890) - "
+            "تم تجاهله والمجموعة الخاصة معطّلة."
+        )
 
 # قائمة المحادثات اللي يستمع لها البوت فعليًا بكل المعالجات أدناه:
 # محادثتك مع نفسك (Saved Messages) دايمًا، + المجموعة الخاصة لو انضبطت.
@@ -147,17 +193,6 @@ except ValueError:
 job_slots = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 queued_jobs = 0
 
-# أرقام المستخدمين المسموح لهم بتشغيل البوت من المجموعة الخاصة (اختياري).
-# فاضي = أي عضو بالمجموعة يقدر يشغّل البوت.
-ALLOWED_USER_IDS: set = set()
-for _part in os.environ.get("ALLOWED_USER_IDS", "").replace(";", ",").split(","):
-    _part = _part.strip()
-    if not _part:
-        continue
-    try:
-        ALLOWED_USER_IDS.add(int(_part))
-    except ValueError:
-        logging.getLogger(__name__).warning(f"رقم غير صالح بـ ALLOWED_USER_IDS: {_part}")
 URL_REGEX = re.compile(r"https?://\S+")
 # رموز تحكم اتجاه النص (Bidi) اللي تيليجرام/لوحة المفاتيح تضيفها تلقائيًا
 # غالبًا لما يختلط عربي وإنجليزي بنفس النص - غير مرئية لكنها تُنسخ فعليًا
@@ -172,6 +207,8 @@ QUALITY_REGEX = re.compile(r"\b(240|360|480|720|1080|1440|2160)\b")
 # كلمة gif / جيف لوحدها (نبحث عنها بالنص بعد إزالة الروابط، عشان ما
 # تتطابق مع رابط فيه كلمة gif مثل .../funny.gif)
 GIF_REGEX = re.compile(r"(?i)(?<![\w])(gif|جيف)(?![\w])")
+# كلمة معاينة / preview بعد الرابط → المعاينة فقط (بدون إرسال الفيديو)
+PREVIEW_REGEX = re.compile(r"(?i)(?<![\w])(معاين[ةه]|preview)(?![\w])")
 # كلمة mp3 / صوت / audio → تحميل الصوت فقط
 AUDIO_REGEX = re.compile(r"(?i)(?<![\w])(mp3|audio|صوت)(?![\w])")
 # مدى القص: 10-20 أو 1:30-1:45 (نمنع الالتصاق بـ - أو : أو . أو حرف، عشان
@@ -289,7 +326,7 @@ async def acquire_job_slot(status, label: str, cancel_event) -> bool:
 
 # إعدادات تحويل GIF (تيليجرام يعرض الـ GIF كفيديو mp4 صامت قصير - أخف
 # وأوضح بكثير من ملف .gif الحقيقي)
-GIF_MAX_SECONDS = int(os.environ.get("GIF_MAX_SECONDS", "30"))
+GIF_MAX_SECONDS = _env_int("GIF_MAX_SECONDS", 30, 1)
 GIF_MAX_WIDTH = 480
 GIF_MAX_HEIGHT = 480
 GIF_FPS = 20
@@ -303,7 +340,7 @@ MP3_BYTES_PER_SEC = 24_000
 # (Saved Messages أو المجموعة، كل محادثة مستقلة)، وأي فيديو أو رابط ترسله
 # يتحول إلى GIF لغاية ما ترسل "الغاء gif". ينتهي تلقائيًا بعد فترة خمول
 # (تتجدد مع كل استخدام) عشان ما تنسى وتتحول روابطك العادية بالغلط.
-GIF_MODE_TIMEOUT_MIN = int(os.environ.get("GIF_MODE_TIMEOUT_MIN", "15"))
+GIF_MODE_TIMEOUT_MIN = _env_int("GIF_MODE_TIMEOUT_MIN", 15, 1)
 gif_mode_until: dict = {}  # chat_id -> وقت انتهاء الوضع (time.monotonic)
 
 
@@ -322,7 +359,441 @@ def touch_gif_mode(chat_id):
     gif_mode_until[chat_id] = time.monotonic() + GIF_MODE_TIMEOUT_MIN * 60
 
 # أقصى حجم للفيديو المرسل عشان نحوّله (بالميجا) - نتفادى تنزيل ملفات ضخمة
-GIF_MAX_INPUT_MB = int(os.environ.get("GIF_MAX_INPUT_MB", "200"))
+GIF_MAX_INPUT_MB = _env_int("GIF_MAX_INPUT_MB", 200, 1)
+
+# ===================== ميزة المعاينة (Preview) =====================
+# معاينة = GIF قصير (mp4 صامت يعرضه تيليجرام كـ GIF) يلخّص الفيديو من بدايته
+# لنهايته: نقتطع عدة مقاطع قصيرة موزّعة بالتساوي على طول الفيديو (أول مقطع
+# من البداية وآخر مقطع ينتهي بنهاية الفيديو، ولا يقل عددها عن 4) ونلصقها
+# بالترتيب بملف واحد.
+# الإعدادات (التفعيل/الدقة/المدة) مستقلة تمامًا عن جودة الفيديو المختارة،
+# وتُحفظ بشكل دائم بالرسالة المثبّتة بـ Saved Messages (راجع save_preview_settings).
+PREVIEW_MIN_SECONDS = 5
+PREVIEW_MAX_SECONDS = 40
+PREVIEW_MIN_SEGMENTS = 4
+PREVIEW_MAX_SEGMENTS = 12
+PREVIEW_SEGMENT_TARGET = 2.5  # الطول المثالي للمقطع الواحد بالثواني
+PREVIEW_MIN_SIDE = 240        # أقل طول للضلع الأطول (ما نصغّر أكثر من هذا)
+PREVIEW_SEGMENT_TIMEOUT = 300  # مهلة ترميز المقطع الواحد (ثانية) - Render المجاني بطيء
+PREVIEW_PROMPT_TTL = 120       # مهلة انتظار ردك على سؤال الدقة/المدة (ثانية)
+try:
+    PREVIEW_MAX_SIDE = max(PREVIEW_MIN_SIDE, int(os.environ.get("PREVIEW_MAX_SIDE", "1920")))
+except ValueError:
+    PREVIEW_MAX_SIDE = 1920
+try:
+    PREVIEW_MAX_INPUT_MB = int(os.environ.get("PREVIEW_MAX_INPUT_MB", "300"))
+except ValueError:
+    PREVIEW_MAX_INPUT_MB = 300
+
+# --- اختيار مقاطع "نظيفة" (يتجنب الأسود/الثابت/المكرر) ---
+# لكل مقطع مخطَّط، نحلّل عدة مواقع مرشّحة قريبة من موقعه المخطَّط بـ ffmpeg
+# (إطارات رمادية مصغّرة 48x48 بدون صوت - سريع جدًا) ونختار أول موقع مقبول.
+# لو ما لقينا مقبولًا نختار الأفضل المتاح (أفضل جهد، ما نفشل المعاينة أبدًا).
+PREVIEW_SMART_PICK = os.environ.get("PREVIEW_SMART_PICK", "1").strip().lower() not in (
+    "0", "false", "no", "off", "لا",
+)
+PREVIEW_PROBE_SIDE = 48          # أبعاد إطار التحليل (مربع رمادي)
+PREVIEW_PROBE_FPS = 2            # إطارات بالثانية داخل نافذة التحليل
+PREVIEW_PROBE_TIMEOUT = 25       # مهلة تحليل نافذة واحدة (ثانية)
+PREVIEW_PROBE_BUDGET = 120       # أقصى وقت إجمالي للتحليل قبل الرجوع للمخطَّط
+PREVIEW_MAX_CANDIDATES = 6       # أقصى مواقع مرشّحة لكل مقطع
+PREVIEW_SHIFT_FRACTIONS = (0.0, 0.2, -0.2, 0.4, -0.4, 0.6)  # نسبة من المسافة بين المقاطع
+PREVIEW_BLACK_LEVEL = 18         # متوسط السطوع (0-255) أقل منه = مظلم/أسود
+PREVIEW_DARK_FRAC = 0.4          # نسبة إطارات مظلمة تُرفض عندها النافذة
+PREVIEW_FLAT_STD = 6.0           # انحراف معياري أقل منه = لون مسطّح/شاشة عنوان
+PREVIEW_STATIC_DIFF = 1.5        # متوسط فرق بين إطارين متتاليين أقل منه = ثابتة
+PREVIEW_DUP_DIFF = 8.0           # فرق عن مقطع سابق أقل منه = مشهد مكرر
+
+# مستويات الدقة: scale = نسبة من دقة الفيديو الأصلي (على حسب كل مقطع)،
+# fps/crf = سلاسة وضغط الترميز. الأعلى دقة = دقة الفيديو نفسه (بحد
+# PREVIEW_MAX_SIDE وبدون تكبير أبدًا).
+PREVIEW_LEVELS = {
+    1: {"name": "أعلى دقة (بدقة الفيديو نفسه)", "scale": 1.0, "fps": 24, "crf": 23},
+    2: {"name": "دقة عالية", "scale": 0.75, "fps": 24, "crf": 24},
+    3: {"name": "متوسطة", "scale": 0.5, "fps": 20, "crf": 26},
+    4: {"name": "أقل من متوسطة", "scale": 0.35, "fps": 16, "crf": 28},
+    5: {"name": "ضعيفة", "scale": 0.25, "fps": 12, "crf": 30},
+}
+# الإعدادات الحالية (تُحمَّل من الرسالة المحفوظة وقت التشغيل)
+preview_settings = {"enabled": False, "level": 3, "seconds": 0}  # seconds=0 → تلقائي
+preview_store_msg_id = None
+PREVIEW_STORE_TAG = "#preview_settings"
+# سؤال دقة/مدة مفتوح بانتظار ردك: chat_id -> {"kind": "level"|"seconds", "expires": ...}
+pending_preview_prompts: dict = {}
+
+
+def sanitize_preview_settings(data) -> dict:
+    """ينظّف قاموس إعدادات (من الرسالة المحفوظة) لقيم صالحة فقط."""
+    out = dict(preview_settings)
+    if not isinstance(data, dict):
+        return out
+    if isinstance(data.get("enabled"), bool):
+        out["enabled"] = data["enabled"]
+    try:
+        level = int(data.get("level", out["level"]))
+        if level in PREVIEW_LEVELS:
+            out["level"] = level
+    except (TypeError, ValueError):
+        pass
+    try:
+        seconds = int(data.get("seconds", out["seconds"]))
+        if seconds == 0 or PREVIEW_MIN_SECONDS <= seconds <= PREVIEW_MAX_SECONDS:
+            out["seconds"] = seconds
+    except (TypeError, ValueError):
+        pass
+    return out
+
+
+def auto_preview_seconds(duration: float) -> int:
+    """مدة المعاينة التلقائية حسب طول الفيديو (15–30 ثانية)."""
+    if duration <= 120:
+        return 15
+    if duration <= 600:
+        return 20
+    if duration <= 1800:
+        return 25
+    return 30
+
+
+def plan_preview(duration: float, seconds_setting: int = 0):
+    """يخطط مقاطع المعاينة: قائمة (بداية، طول) بالثواني، مرتبة من أول
+    الفيديو لآخره وموزّعة بالتساوي. أول مقطع يبدأ من 0، وآخر مقطع ينتهي
+    عند نهاية الفيديو. عدد المقاطع لا يقل عن 4 (ولا يزيد عن 12).
+    لو الفيديو أقصر من مدة المعاينة نفسها، تكون المعاينة هي الفيديو كله
+    (مقطع واحد). يرجّع None لو المدة مجهولة."""
+    if not duration or duration <= 0:
+        return None
+    target = seconds_setting or auto_preview_seconds(duration)
+    target = max(PREVIEW_MIN_SECONDS, min(PREVIEW_MAX_SECONDS, target))
+    if duration <= target + 1:
+        return [(0.0, round(float(duration), 2))]
+    n = round(target / PREVIEW_SEGMENT_TARGET)
+    n = max(PREVIEW_MIN_SEGMENTS, min(PREVIEW_MAX_SEGMENTS, n))
+    seg = target / n
+    step = (duration - seg) / (n - 1)
+    last_start = max(0.0, duration - seg - 0.2)  # نترك هامش صغير قبل النهاية
+    return [
+        (round(min(i * step, last_start), 2), round(seg, 2)) for i in range(n)
+    ]
+
+
+def preview_scale_factor(level: int, long_side: int = 0, override=None) -> float:
+    """نسبة تصغير المعاينة بالنسبة لدقة الملف المتوفر. لا تكبّر أبدًا،
+    ولا تتجاوز PREVIEW_MAX_SIDE، ولا تصغّر الضلع الأطول لأقل من
+    PREVIEW_MIN_SIDE (إلا لو الفيديو نفسه أصغر)."""
+    factor = override if override else PREVIEW_LEVELS.get(level, PREVIEW_LEVELS[3])["scale"]
+    factor = min(float(factor), 1.0)
+    if long_side:
+        factor = min(factor, PREVIEW_MAX_SIDE / long_side)
+        factor = max(factor, min(1.0, PREVIEW_MIN_SIDE / long_side))
+    return factor
+
+
+def pick_preview_download(probe: dict, level: int):
+    """لوضع \"المعاينة فقط\": نحدد أقل صيغة فيديو تكفي لدقة المعاينة
+    المطلوبة (بدل تحميل أعلى جودة كاملة) توفيرًا للباندويدث.
+    يرجّع (format_selector، نسبة التصغير بالنسبة للملف المُحمَّل)."""
+    factor = PREVIEW_LEVELS.get(level, PREVIEW_LEVELS[3])["scale"]
+    heights = sorted(probe.get("heights") or [], reverse=True)
+    if not heights:
+        return "bestvideo/best", None
+    top = heights[0]
+    wanted = top * factor
+    candidates = [h for h in heights if h >= wanted]
+    chosen = min(candidates) if candidates else top
+    relative = min(1.0, wanted / chosen)
+    return f"bestvideo[height<={chosen}]/best[height<={chosen}]/best", relative
+
+
+def _num(value, cast=float, default=0):
+    try:
+        return cast(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def probe_media(path: str) -> dict:
+    """يقرأ أبعاد ومدة ملف عبر ffprobe (يرجّع {} لو فشل)."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=width,height:format=duration",
+                "-of", "json", path,
+            ],
+            capture_output=True, timeout=30,
+        )
+        data = json.loads(result.stdout or b"{}")
+        stream = (data.get("streams") or [{}])[0]
+        fmt = data.get("format") or {}
+        return {
+            "width": _num(stream.get("width"), int),
+            "height": _num(stream.get("height"), int),
+            "duration": _num(fmt.get("duration"), float),
+        }
+    except Exception:
+        logger.exception("تعذر قراءة بيانات الملف عبر ffprobe")
+        return {}
+
+
+def _run_ffmpeg(cmd: list, cancel_event, timeout: int, capture: bool = False):
+    """يشغّل ffmpeg ويراقب الإلغاء (الغاء) والمهلة كل نصف ثانية.
+    capture=True يرجّع مخرجات stdout (بايتات) - تُستخدم لتحليل الإطارات."""
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    started = time.monotonic()
+    while True:
+        try:
+            out, err = proc.communicate(timeout=0.5)
+            break
+        except subprocess.TimeoutExpired:
+            if cancel_event is not None and cancel_event.is_set():
+                proc.kill()
+                proc.communicate()
+                raise RuntimeError(CANCELLED_MARKER)
+            if time.monotonic() - started > timeout:
+                proc.kill()
+                proc.communicate()
+                raise RuntimeError("انتهت مهلة تجهيز المعاينة (السيرفر بطيء أو الفيديو ثقيل)")
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "فشل ffmpeg: " + (err or b"").decode("utf-8", "ignore")[-200:]
+        )
+    return out or b""
+
+
+def analyze_window(filepath: str, start: float, length: float, cancel_event=None):
+    """يحلّل نافذة زمنية من الفيديو بـ ffmpeg (إطارات رمادية 48x48 خام) ويرجّع
+    قاموس مقاييس: bright (متوسط السطوع)، dark_frac (نسبة الإطارات المظلمة)،
+    std (التباين داخل الإطار)، motion (الحركة بين الإطارات)، sig (إطار
+    وسطي للمقارنة مع مقاطع ثانية). يرجّع None لو ما كفت الإطارات."""
+    side = PREVIEW_PROBE_SIDE
+    fsize = side * side
+    out = _run_ffmpeg(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-ss", f"{max(0.0, start):.2f}", "-i", filepath,
+            "-t", f"{length:.2f}", "-an", "-sn",
+            "-vf", f"fps={PREVIEW_PROBE_FPS},scale={side}:{side}:flags=area,format=gray",
+            "-frames:v", "24", "-f", "rawvideo", "-pix_fmt", "gray", "-",
+        ],
+        cancel_event, PREVIEW_PROBE_TIMEOUT, capture=True,
+    )
+    frames = [out[i:i + fsize] for i in range(0, len(out) - fsize + 1, fsize)]
+    if len(frames) < 3:
+        return None
+    n = len(frames)
+    means = [sum(f) / fsize for f in frames]
+    stds = [
+        (sum((p - m) ** 2 for p in f) / fsize) ** 0.5 for f, m in zip(frames, means)
+    ]
+    diffs = [
+        sum(abs(a - b) for a, b in zip(f1, f2)) / fsize
+        for f1, f2 in zip(frames, frames[1:])
+    ]
+    return {
+        "bright": sum(means) / n,
+        "dark_frac": sum(1 for m in means if m < PREVIEW_BLACK_LEVEL) / n,
+        "std": sum(stds) / n,
+        "motion": sum(diffs) / len(diffs),
+        "sig": frames[n // 2],
+    }
+
+
+def _sig_distance(a: bytes, b: bytes) -> float:
+    return sum(abs(x - y) for x, y in zip(a, b)) / max(1, len(a))
+
+
+def score_window(metrics: dict, prev_sigs: list):
+    """يقيّم نافذة: يرجّع (ok، درجة). كل معيار بين 0 و1 (1 = ممتاز):
+    سطوع (مو أسود)، تباين (مو لون مسطّح)، حركة (مو ثابتة)، واختلاف عن المقاطع
+    المختارة قبلها (مو مكررة). ok = كل المعايير ممتازة. الدرجة (أضعف معيار،
+    المجموع) تُستخدم لاختيار الأفضل لو ما فيه نافذة ok."""
+    c_bright = min(1.0, metrics["bright"] / PREVIEW_BLACK_LEVEL)
+    if metrics["dark_frac"] >= PREVIEW_DARK_FRAC:
+        c_bright = min(c_bright, 0.5)
+    c_flat = min(1.0, metrics["std"] / PREVIEW_FLAT_STD)
+    c_motion = min(1.0, metrics["motion"] / PREVIEW_STATIC_DIFF)
+    if prev_sigs:
+        dist = min(_sig_distance(metrics["sig"], p) for p in prev_sigs)
+        c_dup = min(1.0, dist / PREVIEW_DUP_DIFF)
+    else:
+        c_dup = 1.0
+    parts = (c_bright, c_flat, c_motion, c_dup)
+    return min(parts) >= 1.0, (min(parts), sum(parts))
+
+
+def pick_clean_segments(
+    filepath: str, segments: list, duration: float, cancel_event=None, progress=None
+):
+    """يعدّل مواقع بداية المقاطع المخطَّطة لتجنّب اللقطات السوداء/الثابتة/
+    المكررة. لكل مقطع نجرّب مواقع مرشّحة قريبة من موقعه (الأصلي أول) ضمن
+    حدود تحافظ على الترتيب وعدم التداخل، ونأخذ أول موقع مقبول (أو الأفضل لو
+    ما فيه). طول كل مقطع ما يتغير. يرجّع (المقاطع الجديدة، عدد المعدّلة)."""
+    n = len(segments)
+    if n < 2 or duration <= 0:
+        return segments, 0
+    deadline = time.monotonic() + PREVIEW_PROBE_BUDGET
+    chosen, sigs, adjusted = [], [], 0
+    consecutive_fails = 0
+    fractions = PREVIEW_SHIFT_FRACTIONS[:PREVIEW_MAX_CANDIDATES]
+
+    for i, (start, length) in enumerate(segments):
+        step = (segments[i + 1][0] - start) if i + 1 < n else (start - segments[i - 1][0])
+        lo = (chosen[-1][0] + chosen[-1][1] + 0.1) if chosen else 0.0
+        hi = (segments[i + 1][0] - length - 0.1) if i + 1 < n else (duration - length - 0.2)
+        hi = max(hi, lo)
+        cands = []
+        for frac in fractions:
+            cand = round(min(max(start + frac * step, lo), hi), 2)
+            if all(abs(cand - c) > 0.4 for c in cands):
+                cands.append(cand)
+
+        best = None  # (درجة، موقع، مقاييس)
+        for cand in cands:
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError(CANCELLED_MARKER)
+            if time.monotonic() > deadline:
+                break
+            try:
+                metrics = analyze_window(filepath, cand, length, cancel_event)
+            except RuntimeError as e:
+                if str(e) == CANCELLED_MARKER:
+                    raise
+                logger.warning(f"تعذر تحليل نافذة المعاينة عند {cand}s: {str(e)[:120]}")
+                consecutive_fails += 1
+                if consecutive_fails >= 3:
+                    # الملف غالبًا غير قابل للتحليل - ما نكرر عشرات المحاولات
+                    raise RuntimeError("تكرر فشل تحليل المعاينة")
+                continue
+            if metrics is None:
+                continue
+            consecutive_fails = 0
+            ok, score = score_window(metrics, sigs)
+            if best is None or score > best[0]:
+                best = (score, cand, metrics)
+            if ok:
+                break
+
+        pick = best[1] if best else cands[0]
+        if best:
+            sigs.append(best[2]["sig"])
+        if abs(pick - start) > 0.05:
+            adjusted += 1
+        chosen.append((pick, length))
+        if progress:
+            progress(i + 1, n)
+    return chosen, adjusted
+
+
+def make_preview(
+    filepath: str,
+    level: int,
+    seconds_setting: int = 0,
+    duration_hint: float = 0,
+    scale_override=None,
+    cancel_event=None,
+    progress=None,
+):
+    """يبني المعاينة: يرمّز كل مقطع بنفسه (بحث سريع -ss قبل -i، ومقطع واحد
+    بالمرة = ذاكرة قليلة تناسب Render المجاني) ثم يلصقها بالترتيب بدون
+    إعادة ترميز. يرجّع قاموسًا: path/width/height/duration/segments/size.
+    progress(i, n) اختياري لتحديث النسبة."""
+    info = probe_media(filepath)
+    duration = info.get("duration") or duration_hint or 0
+    segments = plan_preview(duration, seconds_setting)
+    if not segments:
+        raise RuntimeError("ما قدرت أعرف مدة الفيديو لتجهيز المعاينة")
+
+    # اختيار ذكي: تجنّب اللقطات السوداء/الثابتة/المكررة (فشله لا يمنع المعاينة)
+    smart_on = PREVIEW_SMART_PICK and len(segments) > 1
+    analysis_steps = len(segments) if smart_on else 0
+    total_steps = analysis_steps + len(segments)
+    adjusted = 0
+    if smart_on:
+        try:
+            segments, adjusted = pick_clean_segments(
+                filepath, segments, duration, cancel_event,
+                (lambda i, n: progress(i, total_steps)) if progress else None,
+            )
+            logger.info(f"اختيار المعاينة الذكي: عُدّل {adjusted} من {len(segments)} مقطع")
+        except RuntimeError as e:
+            if str(e) == CANCELLED_MARKER:
+                raise
+            logger.warning(f"تخطّينا الاختيار الذكي للمعاينة: {e}")
+        except Exception:
+            logger.exception("خطأ بالاختيار الذكي للمعاينة - استُخدمت المواقع المخطَّطة")
+
+    long_side = max(info.get("width", 0), info.get("height", 0))
+    factor = preview_scale_factor(level, long_side, scale_override)
+    params = PREVIEW_LEVELS.get(level, PREVIEW_LEVELS[3])
+    # scale بالنسبة المئوية من أبعاد الإطار الفعلية (يشتغل صح مع الفيديو
+    # العمودي/المدوّر) مع جعل الأبعاد زوجية (شرط H.264)
+    vf = (
+        f"fps={params['fps']},"
+        f"scale=w='trunc(iw*{factor:.4f}/2)*2':h='trunc(ih*{factor:.4f}/2)*2',"
+        "setsar=1"
+    )
+    work_dir = os.path.dirname(os.path.abspath(filepath))
+    seg_paths = [os.path.join(work_dir, f"_pv_{i}.mp4") for i in range(len(segments))]
+    out_path = os.path.join(work_dir, "_preview.mp4")
+    list_path = os.path.join(work_dir, "_pv_list.txt")
+
+    try:
+        for i, (start, length) in enumerate(segments):
+            _run_ffmpeg(
+                [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-ss", f"{start:.2f}", "-i", filepath,
+                    "-t", f"{length:.2f}", "-an", "-vf", vf,
+                    "-c:v", "libx264", "-preset", "veryfast",
+                    "-crf", str(params["crf"]), "-pix_fmt", "yuv420p",
+                    seg_paths[i],
+                ],
+                cancel_event, PREVIEW_SEGMENT_TIMEOUT,
+            )
+            if not os.path.exists(seg_paths[i]) or os.path.getsize(seg_paths[i]) == 0:
+                raise RuntimeError("تعذر استخراج أحد مقاطع المعاينة")
+            if progress:
+                progress(analysis_steps + i + 1, total_steps)
+
+        if len(seg_paths) == 1:
+            os.replace(seg_paths[0], out_path)
+        else:
+            with open(list_path, "w", encoding="utf-8") as f:
+                for sp in seg_paths:
+                    f.write(f"file '{sp}'\n")
+            _run_ffmpeg(
+                [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "concat", "-safe", "0", "-i", list_path,
+                    "-c", "copy", "-movflags", "+faststart", out_path,
+                ],
+                cancel_event, 120,
+            )
+    finally:
+        for sp in seg_paths + [list_path]:
+            try:
+                os.remove(sp)
+            except OSError:
+                pass
+
+    if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        raise RuntimeError("المعاينة الناتجة فاضية")
+    out_info = probe_media(out_path)
+    return {
+        "path": out_path,
+        "width": out_info.get("width") or 0,
+        "height": out_info.get("height") or 0,
+        "duration": out_info.get("duration") or sum(l for _, l in segments),
+        "segments": len(segments),
+        "adjusted": adjusted,
+        "size": os.path.getsize(out_path),
+    }
+
 
 # مواقع "مرآة" (نفس المحتوى، دومين مختلف) غير مدعومة مباشرة من yt-dlp
 # فيرجع لها لآلية استخراج عامة (generic extractor) ما تقدر تكتشف
@@ -350,7 +821,8 @@ def is_allowed_trigger(event) -> bool:
     if event.is_private and event.out:
         return True
     if GROUP_CHAT_ID and event.chat_id == GROUP_CHAT_ID and not event.out:
-        # لو حددت ALLOWED_USER_IDS، فقط هذي الأرقام تقدر تشغّل البوت
+        # لو حددت ALLOWED_USER_IDS، فقط هذي الأرقام تقدر تشغّل البوت،
+        # وإلا أي عضو بالمجموعة الخاصة مقبول
         if ALLOWED_USER_IDS and getattr(event, "sender_id", None) not in ALLOWED_USER_IDS:
             return False
         return True
@@ -393,10 +865,12 @@ if COOKIES_B64:
 
 client = TelegramClient(
     StringSession(SESSION_STRING), API_ID, API_HASH,
-    # نمنع Telethon من النوم تلقائيًا عند استقبال FloodWaitError (سلوكه
-    # الافتراضي لو المدة أقل من 60 ثانية) - بدلها نخلي الخطأ يوصل لكودنا
-    # فورًا عشان نتجاهله بأنفسنا عبر safe_edit بدون أي تأخير حقيقي.
-    flood_sleep_threshold=0,
+    # نخلي Telethon ينتظر تلقائيًا لو FloodWait قصير (≤60 ثانية - الافتراضي).
+    # هذا ضروري لرفع الملفات الكبيرة: بدونه أي Flood قصير بين أجزاء الرفع
+    # كان يفشل العملية كلها بعد ما ينتهي التحميل. تعديلات رسالة الحالة
+    # تحميها safe_edit بمهلة قصيرة (ما تعطّل الرفع)، والانتظار الأطول من
+    # 60 ثانية يوصل لكودنا ونتعامل معه عبر safe_*.
+    flood_sleep_threshold=60,
 )
 
 # قائمة العمليات الجارية حاليًا (تحميل/إرسال) - كل عملية عندها
@@ -605,7 +1079,11 @@ async def safe_edit(status_msg, text: str):
     if status_msg is None:
         return
     try:
-        await status_msg.edit(text)
+        # مهلة قصيرة: لو تيليجرام طلب انتظار (Flood) نتنازل عن هذا التحديث
+        # بدل ما يتكدّس (التحديث التالي يعوّضه) ولا يعطّل العملية.
+        await asyncio.wait_for(status_msg.edit(text), timeout=15)
+    except asyncio.TimeoutError:
+        logger.warning("تعديل رسالة الحالة تأخر (على الأرجح Flood) - تجاهلناه")
     except FloodWaitError as e:
         logger.warning(f"FloodWaitError عند تعديل الرسالة - تجاهلناها ({e.seconds}s)")
     except Exception:
@@ -662,6 +1140,408 @@ async def safe_respond(event, text: str = ""):
     except Exception:
         logger.exception("خطأ غير متوقع أثناء الرد")
         return None
+
+
+# ===================== المعاينة: الحفظ الدائم والإرسال والأوامر =====================
+def _preview_store_text() -> str:
+    return (
+        "⚙️ إعدادات المعاينة - لا تحذف هذي الرسالة (البوت يحفظ فيها إعداداتك "
+        f"عشان ما تضيع مع إعادة التشغيل) {PREVIEW_STORE_TAG}\n"
+        + json.dumps(preview_settings, ensure_ascii=False)
+    )
+
+
+def parse_preview_store_text(text: str):
+    """يستخرج قاموس الإعدادات من نص الرسالة المحفوظة (أو None)."""
+    if not text or PREVIEW_STORE_TAG not in text:
+        return None
+    start = text.find("{", text.find(PREVIEW_STORE_TAG))
+    end = text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        return json.loads(text[start:end + 1])
+    except ValueError:
+        return None
+
+
+async def load_preview_settings():
+    """وقت التشغيل: يدوّر على رسالة الإعدادات المحفوظة بـ Saved Messages
+    ويطبّقها. Render المجاني يمسح ملفات السيرفر مع كل إعادة تشغيل، فنحفظ
+    الإعدادات بتيليجرام نفسه عشان تبقى دائمة."""
+    global preview_store_msg_id
+    try:
+        found = None
+        async for m in client.iter_messages("me", search=PREVIEW_STORE_TAG, limit=10):
+            if m.out and PREVIEW_STORE_TAG in (m.raw_text or ""):
+                found = m
+                break
+        if found is None:  # احتياط: البحث بالهاشتاغ أحيانًا ما يرجّع نتيجة
+            async for m in client.iter_messages("me", limit=100):
+                if m.out and PREVIEW_STORE_TAG in (m.raw_text or ""):
+                    found = m
+                    break
+        if found is None:
+            logger.info("ما فيه إعدادات معاينة محفوظة - نستخدم الافتراضي")
+            return
+        parsed = parse_preview_store_text(found.raw_text)
+        if parsed is not None:
+            preview_settings.update(sanitize_preview_settings(parsed))
+            preview_store_msg_id = found.id
+            logger.info(f"إعدادات المعاينة المحمّلة: {preview_settings}")
+    except Exception:
+        logger.exception("تعذر تحميل إعدادات المعاينة المحفوظة - نستخدم الافتراضي")
+
+
+async def save_preview_settings() -> bool:
+    """يحفظ الإعدادات الحالية بالرسالة المحفوظة (يعدّلها، أو ينشئها أول مرة).
+    يرجّع True لو انحفظت."""
+    global preview_store_msg_id
+    text = _preview_store_text()
+    try:
+        if preview_store_msg_id:
+            try:
+                await client.edit_message("me", preview_store_msg_id, text)
+                return True
+            except MessageNotModifiedError:
+                return True
+            except Exception:
+                logger.warning("تعذر تعديل رسالة الإعدادات (يمكن انحذفت) - ننشئ جديدة")
+                preview_store_msg_id = None
+        msg = await client.send_message("me", text)
+        preview_store_msg_id = msg.id
+        bot_sent_ids.append((msg.chat_id, msg.id))
+        return True
+    except FloodWaitError as e:
+        logger.warning(f"FloodWaitError عند حفظ إعدادات المعاينة ({e.seconds}s)")
+        return False
+    except Exception:
+        logger.exception("تعذر حفظ إعدادات المعاينة")
+        return False
+
+
+async def build_and_send_preview(
+    chat_id,
+    src_path: str,
+    title: str,
+    operation: dict,
+    cancel_event,
+    duration_hint: float = 0,
+    scale_override=None,
+    reply_to=None,
+):
+    """يبني المعاينة من الملف ويرسلها (كـ GIF متحرك) للمحادثة. يرفع
+    RuntimeError(CANCELLED_MARKER) لو ألغى المستخدم."""
+    previous_stage = operation.get("stage")
+    operation["stage"] = "converting"
+    operation["percent"] = 0.0
+
+    def on_progress(done: int, total: int):
+        operation["percent"] = done / total * 100
+
+    result = await asyncio.to_thread(
+        make_preview,
+        src_path,
+        preview_settings["level"],
+        preview_settings["seconds"],
+        duration_hint,
+        scale_override,
+        cancel_event,
+        on_progress,
+    )
+    thumb_path = await asyncio.to_thread(generate_thumbnail, result["path"])
+    head = f"🖼️ معاينة — {title[:200]}" if title else "🖼️ معاينة"
+    caption = (
+        f"{head}\n🎬 {result['segments']} مقاطع · ⏱️ {int(round(result['duration']))} ثانية"
+        f" · 📐 {result['width']}x{result['height']} · 📦 {format_size(result['size'])}"
+    )
+    operation["stage"] = "uploading"
+    await send_bot_file(
+        chat_id,
+        result["path"],
+        caption=caption,
+        reply_to=reply_to,
+        supports_streaming=True,
+        thumb=thumb_path,
+        attributes=[
+            DocumentAttributeVideo(
+                duration=int(round(result["duration"])),
+                w=result["width"] or 640,
+                h=result["height"] or 360,
+                supports_streaming=True,
+            ),
+            DocumentAttributeAnimated(),
+        ],
+    )
+    stats["total_bytes_sent"] += result["size"]
+    operation["stage"] = previous_stage
+    return result
+
+
+def build_preview_menu_text() -> str:
+    level = preview_settings["level"]
+    seconds = preview_settings["seconds"]
+    state = "مفعّلة ✅" if preview_settings["enabled"] else "معطّلة ⛔"
+    duration_line = (
+        "تلقائية (15–30 ثانية حسب طول الفيديو)" if not seconds else f"{seconds} ثانية"
+    )
+    return (
+        "🖼️ **المعاينة** — GIF مختصر يلخّص الفيديو من بدايته لنهايته "
+        f"(لا يقل عن {PREVIEW_MIN_SEGMENTS} مقاطع بالترتيب)\n\n"
+        f"• الحالة: {state}\n"
+        f"• الدقة: {level} — {PREVIEW_LEVELS[level]['name']}\n"
+        f"• المدة: {duration_line}\n\n"
+        "**الأوامر:**\n"
+        "• `تفعيل المعاينة` → ترسل لك معاينة مع كل فيديو يتحمّل، ومعاينة لأي "
+        "فيديو ترسله للبوت\n"
+        "• `تعطيل المعاينة` → إيقاف الميزة\n"
+        "• `دقة المعاينة` → اختيار الدقة (أو مباشرة: `دقة المعاينة 2`)\n"
+        f"• `مدة المعاينة` → من {PREVIEW_MIN_SECONDS} إلى {PREVIEW_MAX_SECONDS} "
+        "ثانية أو تلقائي (أو مباشرة: `مدة المعاينة 20`)\n"
+        "• `الرابط معاينة` → المعاينة فقط بدون الفيديو (يحمّل أقل دقة تكفيها)\n"
+        "• فيديو مرسل وبوصفه `معاينة` → معاينته حتى لو الميزة معطّلة\n\n"
+        "(الإعدادات تُحفظ بشكل دائم، ودقة المعاينة مستقلة عن جودة الفيديو اللي تختارها)"
+    )
+
+
+def build_level_prompt() -> str:
+    current = preview_settings["level"]
+    lines = ["🎚️ اختر دقة المعاينة (رد برقم الخيار):\n"]
+    for num, params in PREVIEW_LEVELS.items():
+        mark = " ✅ (الحالية)" if num == current else ""
+        lines.append(f"{num}. {params['name']}{mark}")
+    lines.append(
+        "\n(الدقة نسبة من دقة كل فيديو نفسه، وما تتجاوز دقة الملف المحمّل)"
+    )
+    return "\n".join(lines)
+
+
+def build_seconds_prompt() -> str:
+    seconds = preview_settings["seconds"]
+    current = "تلقائي" if not seconds else f"{seconds} ثانية"
+    return (
+        f"⏱️ أرسل مدة المعاينة بالثواني (من {PREVIEW_MIN_SECONDS} إلى "
+        f"{PREVIEW_MAX_SECONDS})، أو `تلقائي`.\n(الحالية: {current})"
+    )
+
+
+async def _apply_preview_setting(event, key: str, value, label: str):
+    """يطبّق إعداد جديد ويحفظه ويرد بتأكيد."""
+    preview_settings[key] = value
+    saved = await save_preview_settings()
+    note = "محفوظ بشكل دائم" if saved else "⚠️ طُبّق لكن تعذر الحفظ الدائم (يرجع للقديم بعد إعادة التشغيل)"
+    await safe_respond(event, f"✅ {label}\n({note})")
+
+
+def _open_preview_prompt(chat_id, kind: str):
+    pending_preview_prompts[chat_id] = {
+        "kind": kind,
+        "expires": time.monotonic() + PREVIEW_PROMPT_TTL,
+    }
+
+
+@client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=r"(?i)^((ال)?معاين[ةه]|preview)$"))
+async def handle_preview_menu(event):
+    if not is_allowed_trigger(event):
+        return
+    await safe_respond(event, build_preview_menu_text())
+
+
+@client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=r"(?i)^(تفعيل|تشغيل|فعّل|فعل)\s+(ال)?معاين[ةه]$"))
+async def handle_preview_on(event):
+    if not is_allowed_trigger(event):
+        return
+    await _apply_preview_setting(
+        event, "enabled", True,
+        "تم تفعيل المعاينة - بترسل لك معاينة مع كل فيديو يتحمّل، ولأي فيديو ترسله للبوت.",
+    )
+
+
+@client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=r"(?i)^(تعطيل|ايقاف|إيقاف|وقف|عطّل|عطل)\s+(ال)?معاين[ةه]$"))
+async def handle_preview_off(event):
+    if not is_allowed_trigger(event):
+        return
+    await _apply_preview_setting(event, "enabled", False, "تم تعطيل المعاينة.")
+
+
+@client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=r"(?i)^دق[ةه]\s+(ال)?معاين[ةه](?:\s+(\d+))?$"))
+async def handle_preview_level(event):
+    if not is_allowed_trigger(event):
+        return
+    arg = event.pattern_match.group(2)
+    if arg is None:
+        _open_preview_prompt(event.chat_id, "level")
+        await safe_respond(event, build_level_prompt())
+        return
+    level = int(arg)
+    if level not in PREVIEW_LEVELS:
+        await safe_respond(event, f"❌ رقم غير صالح. اختر من 1 إلى {len(PREVIEW_LEVELS)}.")
+        return
+    pending_preview_prompts.pop(event.chat_id, None)
+    await _apply_preview_setting(
+        event, "level", level, f"دقة المعاينة: {level} — {PREVIEW_LEVELS[level]['name']}"
+    )
+
+
+@client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=r"(?i)^مد[ةه]\s+(ال)?معاين[ةه](?:\s+(\d+|تلقائي|تلقائى|auto))?$"))
+async def handle_preview_duration(event):
+    if not is_allowed_trigger(event):
+        return
+    arg = event.pattern_match.group(2)
+    if arg is None:
+        _open_preview_prompt(event.chat_id, "seconds")
+        await safe_respond(event, build_seconds_prompt())
+        return
+    await _set_preview_seconds(event, arg)
+
+
+async def _set_preview_seconds(event, arg: str) -> bool:
+    if arg.lower() in ("تلقائي", "تلقائى", "auto"):
+        pending_preview_prompts.pop(event.chat_id, None)
+        await _apply_preview_setting(event, "seconds", 0, "مدة المعاينة: تلقائية (15–30 ثانية حسب طول الفيديو)")
+        return True
+    seconds = int(arg)
+    if not PREVIEW_MIN_SECONDS <= seconds <= PREVIEW_MAX_SECONDS:
+        await safe_respond(
+            event, f"❌ المدة لازم تكون من {PREVIEW_MIN_SECONDS} إلى {PREVIEW_MAX_SECONDS} ثانية."
+        )
+        return False
+    pending_preview_prompts.pop(event.chat_id, None)
+    await _apply_preview_setting(event, "seconds", seconds, f"مدة المعاينة: {seconds} ثانية")
+    return True
+
+
+@client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=r"(?i)^(\d{1,3}|تلقائي|تلقائى|auto)$"))
+async def handle_preview_reply(event):
+    """يلتقط ردك (رقم أو تلقائي) على سؤال دقة/مدة المعاينة المفتوح فقط."""
+    if not is_allowed_trigger(event):
+        return
+    chat_id = event.chat_id
+    pending = pending_preview_prompts.get(chat_id)
+    if not pending:
+        return
+    if time.monotonic() > pending["expires"]:
+        pending_preview_prompts.pop(chat_id, None)
+        return
+    # سؤال جودة فيديو مفتوح؟ الأرقام له (handle_message) مو لنا
+    future = pending_quality_futures.get(chat_id)
+    if future is not None and not future.done():
+        return
+    text = (event.raw_text or "").strip()
+    if pending["kind"] == "level":
+        if text.isdigit() and int(text) in PREVIEW_LEVELS:
+            pending_preview_prompts.pop(chat_id, None)
+            level = int(text)
+            await _apply_preview_setting(
+                event, "level", level,
+                f"دقة المعاينة: {level} — {PREVIEW_LEVELS[level]['name']}",
+            )
+        else:
+            await safe_respond(event, f"❌ رد برقم من 1 إلى {len(PREVIEW_LEVELS)}.")
+    else:
+        await _set_preview_seconds(event, text)
+
+
+@client.on(events.NewMessage(chats=ALLOWED_CHATS))
+async def handle_uploaded_preview(event):
+    """فيديو مرسل للبوت → يرسل معاينته، لو ميزة المعاينة مفعّلة أو لو كتبت
+    `معاينة` بوصف الفيديو. وضع GIF (أو كلمة gif بالوصف) له الأولوية، ويتجاهل
+    أي فيديو أرسله البوت نفسه (نفس حماية handle_uploaded_video)."""
+    if not is_allowed_trigger(event):
+        return
+    msg = event.message
+    doc = msg.document
+    if doc is None:
+        return
+    mime = getattr(doc, "mime_type", "") or ""
+    if not mime.startswith("video/") or msg.gif or msg.video_note:
+        return
+
+    caption = event.raw_text or ""
+    caption_no_urls = URL_REGEX.sub(" ", caption)
+    asked = bool(PREVIEW_REGEX.search(caption_no_urls))
+    if not (asked or preview_settings["enabled"]):
+        return
+    if is_gif_mode(event.chat_id) or GIF_REGEX.search(caption_no_urls):
+        return
+
+    await asyncio.sleep(2.5)  # عشان رقم رسالة البوت نفسه (لو هو المرسل) يتسجل أول
+    if (event.chat_id, msg.id) in bot_sent_ids:
+        return
+
+    if doc.size and doc.size > PREVIEW_MAX_INPUT_MB * 1024 * 1024:
+        await safe_respond(
+            event,
+            f"⚠️ الفيديو أكبر من {PREVIEW_MAX_INPUT_MB} ميجا، تعذر عمل معاينة له "
+            "(تغيّره بمتغير PREVIEW_MAX_INPUT_MB).",
+        )
+        return
+
+    vattr = next(
+        (a for a in doc.attributes if isinstance(a, DocumentAttributeVideo)), None
+    )
+    duration = int(vattr.duration) if vattr and vattr.duration else 0
+
+    status = await safe_respond(event, "🖼️ جاري تجهيز معاينة الفيديو...\n(أرسل \"الغاء\" للإيقاف)")
+    tmp_dir = tempfile.mkdtemp(prefix="ytdlp_")
+    cancel_event = threading.Event()
+    operation = {
+        "cancel_event": cancel_event,
+        "url": "فيديو مرسل ← معاينة",
+        "tmp_dir": tmp_dir,
+        "stage": "queued",
+        "percent": 0.0,
+        "started": time.monotonic(),
+    }
+    active_operations.append(operation)
+
+    def download_progress(current: int, total: int):
+        if cancel_event.is_set():
+            raise RuntimeError(CANCELLED_MARKER)
+        if total:
+            operation["percent"] = current / total * 100
+
+    slot_held = False
+    try:
+        await acquire_job_slot(status, "فيديو مرسل ← معاينة", cancel_event)
+        slot_held = True
+        operation["stage"] = "downloading"
+        src_path = await client.download_media(
+            msg, file=tmp_dir, progress_callback=download_progress
+        )
+        if not src_path or not os.path.exists(src_path):
+            raise FileNotFoundError("تعذر تنزيل الفيديو")
+        await build_and_send_preview(
+            event.chat_id, src_path, "", operation, cancel_event,
+            duration_hint=duration, reply_to=msg.id,
+        )
+        stats["completed_downloads"] += 1
+        record_finished(operation, "done")
+        if status is not None:
+            try:
+                await status.delete()
+            except FloodWaitError:
+                pass
+    except RuntimeError as e:
+        if str(e) == CANCELLED_MARKER:
+            record_finished(operation, "cancelled")
+            await safe_edit(status, "🛑 تم إلغاء تجهيز المعاينة.")
+        else:
+            stats["failed_downloads"] += 1
+            logger.exception("فشل تجهيز معاينة فيديو مرسل")
+            record_finished(operation, "failed", str(e)[:150])
+            await safe_edit(status, f"❌ تعذر تجهيز المعاينة: {str(e)[:150]}")
+    except Exception as e:
+        stats["failed_downloads"] += 1
+        logger.exception("خطأ غير متوقع أثناء تجهيز معاينة فيديو مرسل")
+        record_finished(operation, "failed", str(e)[:150])
+        await safe_edit(status, f"❌ حدث خطأ غير متوقع: {str(e)[:150]}")
+    finally:
+        if slot_held:
+            job_slots.release()
+        if operation in active_operations:
+            active_operations.remove(operation)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 @client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=r"(?i)^(الغاء|إلغاء|cancel|stop)$"))
@@ -916,6 +1796,7 @@ def build_help_text() -> str:
         "• `gif` أو `جيف` → GIF متحرك\n"
         "• `mp3` أو `صوت` أو `audio` → صوت فقط بصيغة MP3\n"
         "• `10-20` أو `1:30-1:45` → قص مقطع (من ثانية إلى ثانية، مع gif فقط)\n"
+        "• `معاينة` → معاينة الفيديو فقط بدون إرساله (راجع قسم المعاينة)\n"
         "• تركيبة مثال: `الرابط gif 360 10-20`\n\n"
         "🎞️ **وضع GIF (لعدة فيديوهات)**\n"
         "• `gif` (أو `جيف`) لحالها → يدخل الوضع: أي فيديو ترسله (رفع أو إعادة "
@@ -926,6 +1807,12 @@ def build_help_text() -> str:
         "مثل `gif 5-15`)\n"
         f"• الحد الأقصى {GIF_MAX_SECONDS} ثانية (يقصّ الباقي)، بدون صوت، "
         f"وعرض أقصى {GIF_MAX_WIDTH}\n\n"
+        "🖼️ **المعاينة** (GIF يلخّص الفيديو من بدايته لنهايته)\n"
+        "• `معاينة` → قائمة أوامر المعاينة وحالتها\n"
+        "• `تفعيل المعاينة` / `تعطيل المعاينة` → مع كل فيديو يتحمّل أو يُرسل للبوت\n"
+        "• `دقة المعاينة` → اختيار الدقة من 5 مستويات (محفوظة بشكل دائم)\n"
+        f"• `مدة المعاينة` → من {PREVIEW_MIN_SECONDS} إلى {PREVIEW_MAX_SECONDS} ثانية أو تلقائي\n"
+        "• `الرابط معاينة` → المعاينة فقط بدون الفيديو\n\n"
         "**أوامر التحكم:**\n"
         "• `الغاء` - يوقف أي تحميل شغّال أو ينتظر بالطابور\n"
         "• `تنظيف` - يمسح الملفات المؤقتة المتراكمة\n"
@@ -949,6 +1836,12 @@ def build_settings_text() -> str:
     users_line = (
         f"{len(ALLOWED_USER_IDS)} رقم مسموح" if ALLOWED_USER_IDS else "غير محدد (أي عضو بالمجموعة)"
     )
+    if GROUP_CHAT_ID:
+        group_line = "مضبوط ✅"
+    elif GROUP_REQUESTED:
+        group_line = "معطّلة ⛔ (القيمة لازم تكون رقمًا صحيحًا)"
+    else:
+        group_line = "غير مضبوط"
     return (
         "⚙️ **الإعدادات الحالية** (تغيّرها من Render ← Environment)\n\n"
         "**الأداء والحدود:**\n"
@@ -961,8 +1854,17 @@ def build_settings_text() -> str:
         "خروج وضع GIF تلقائيًا\n"
         f"• `GIF_MAX_INPUT_MB` = {GIF_MAX_INPUT_MB} - أقصى حجم لفيديو مرفوع "
         "يتحول لـ GIF\n\n"
+        "**المعاينة:**\n"
+        f"• الحالة: {'مفعّلة ✅' if preview_settings['enabled'] else 'معطّلة ⛔'} · "
+        f"الدقة: {preview_settings['level']} ({PREVIEW_LEVELS[preview_settings['level']]['name']}) · "
+        f"المدة: {'تلقائية' if not preview_settings['seconds'] else str(preview_settings['seconds']) + ' ثانية'} "
+        "(تتغيّر بالأوامر وتُحفظ دائمًا، مو من Render)\n"
+        f"• `PREVIEW_MAX_SIDE` = {PREVIEW_MAX_SIDE} - أقصى طول للضلع الأطول بالمعاينة\n"
+        f"• `PREVIEW_MAX_INPUT_MB` = {PREVIEW_MAX_INPUT_MB} - أقصى حجم لفيديو مرسل تُصنع له معاينة\n"
+        f"• `PREVIEW_SMART_PICK` = {'مفعّل ✅' if PREVIEW_SMART_PICK else 'معطّل ⛔'} - "
+        "تجنّب اللقطات السوداء/الثابتة/المكررة بالمعاينة\n\n"
         "**الأمان والمجموعة:**\n"
-        f"• `GROUP_CHAT_ID` = {'مضبوط ✅' if GROUP_CHAT_ID else 'غير مضبوط'} - "
+        f"• `GROUP_CHAT_ID` = {group_line} - "
         "المجموعة الخاصة لأرقامك الثانية\n"
         f"• `ALLOWED_USER_IDS` = {users_line}\n"
         f"• `COOKIES_B64` = {'مضبوط ✅' if COOKIES_FILE_PATH else 'غير مضبوط'} - "
@@ -1226,8 +2128,13 @@ async def handle_message(event):
     # كلمة داخل الرابط نفسه (مثل /video/480/) ما تنحسب كطلب من المستخدم
     text_no_urls = URL_REGEX.sub(" ", text)
     # كلمة mp3/صوت صريحة تتغلب على وضع GIF (طلب صوت فقط لهذا الرابط)
-    as_audio = bool(AUDIO_REGEX.search(text_no_urls))
-    as_gif = (bool(GIF_REGEX.search(text_no_urls)) or is_gif_mode(chat_id)) and not as_audio
+    # كلمة معاينة/preview = المعاينة فقط بدون الفيديو (تتغلب على gif/mp3)
+    as_preview = bool(PREVIEW_REGEX.search(text_no_urls))
+    as_audio = bool(AUDIO_REGEX.search(text_no_urls)) and not as_preview
+    as_gif = (
+        (bool(GIF_REGEX.search(text_no_urls)) or is_gif_mode(chat_id))
+        and not as_audio and not as_preview
+    )
     if as_gif and is_gif_mode(chat_id):
         touch_gif_mode(chat_id)
 
@@ -1250,7 +2157,7 @@ async def handle_message(event):
         await safe_respond(event, f"📋 لقيت {len(urls)} روابط، رح أعالجهم بالترتيب...")
 
     for url in urls:
-        await process_single_url(event, url, quality, as_gif, clip, as_audio)
+        await process_single_url(event, url, quality, as_gif, clip, as_audio, as_preview)
 
 
 def build_probe_ydl_opts() -> dict:
@@ -1429,12 +2336,13 @@ async def process_single_url(
     as_gif: bool = False,
     clip=None,
     as_audio: bool = False,
+    as_preview: bool = False,
 ):
     """يحمّل رابط واحد ويرسله، مع تحديث حي لنسبة التقدم بنفس الرسالة.
     quality: أعلى ارتفاع مسموح (مثل 720)، أو None لأعلى جودة متوفرة
     (لو None، يسأل المستخدم أولاً عن الجودات الحقيقية المتوفرة - إلا
     لو فيه جودة وحدة بس متوفرة، بهالحالة ما فيه داعي نسأل)."""
-    if quality is None and not as_gif and not as_audio:
+    if quality is None and not as_gif and not as_audio and not as_preview:
         try:
             probe = await asyncio.to_thread(probe_formats, url)
         except Exception:
@@ -1462,6 +2370,8 @@ async def process_single_url(
             quality_label += f" ✂️ {clip[0]}-{clip[1]}"
     elif as_audio:
         quality_label += " 🎵 (صوت فقط)"
+    elif as_preview:
+        quality_label += " 🖼️ (معاينة فقط)"
     status = await safe_respond(event, 
         f"⏳ جاري التحميل...{quality_label} 0%\n{url}\n\n"
         "(أرسل \"الغاء\" لإيقاف هذا التحميل)"
@@ -1529,6 +2439,10 @@ async def process_single_url(
     if as_audio:
         # صوت فقط: نطلب أفضل مسار صوت (أو أفضل صيغة لو الموقع ما يفصل)
         fmt = "bestaudio/best"
+    elif as_preview:
+        # المعاينة فقط: فيديو بدون صوت، والدقة المناسبة تُحدَّد بعد استعلام
+        # الجودات داخل try (pick_preview_download) توفيرًا للباندويدث
+        fmt = "bestvideo/best"
     elif as_gif:
         # GIF صامت وقصير: ما نحتاج جودة عالية ولا صوت - نطلب فيديو فقط
         # بحد أقصى GIF_MAX_HEIGHT (أو الجودة اللي حددها المستخدم) لتوفير
@@ -1604,6 +2518,17 @@ async def process_single_url(
                 "(أرسل \"الغاء\" لإيقاف هذا التحميل)",
             )
 
+        preview_scale = None
+        if as_preview:
+            try:
+                preview_probe = await asyncio.to_thread(probe_formats, url)
+            except Exception:
+                logger.exception("تعذر جلب الجودات لتحديد أنسب تنزيل للمعاينة")
+                preview_probe = {"heights": [], "sizes": {}, "duration": 0}
+            ydl_opts["format"], preview_scale = pick_preview_download(
+                preview_probe, preview_settings["level"]
+            )
+
         download_started_at = time.time()
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = await asyncio.to_thread(ydl.extract_info, url, download=True)
@@ -1648,6 +2573,44 @@ async def process_single_url(
 
         if not os.path.exists(filename):
             raise FileNotFoundError("تعذر إيجاد الملف بعد التحميل")
+
+        # ---- المعاينة ----
+        if as_preview:
+            # معاينة فقط: نبنيها ونرسلها ونوقف (بدون إرسال الفيديو)
+            await safe_edit(status, f"🖼️ جاري تجهيز المعاينة...\n{url}")
+            try:
+                await build_and_send_preview(
+                    event.chat_id, filename, info.get("title") or "", operation,
+                    cancel_event, int(info.get("duration") or 0), preview_scale,
+                )
+            except RuntimeError as e:
+                if str(e) == CANCELLED_MARKER:
+                    raise
+                raise UserFacingError(f"تعذر تجهيز المعاينة: {str(e)[:120]}")
+            stats["completed_downloads"] += 1
+            record_finished(operation, "done")
+            if status is not None:
+                try:
+                    await status.delete()
+                except FloodWaitError:
+                    pass
+            return
+        if preview_settings["enabled"] and not as_audio and not as_gif:
+            # المعاينة مفعّلة: نرسلها أول، وبعدها الفيديو. لو فشلت ما نمنع الفيديو.
+            await safe_edit(status, f"🖼️ جاري تجهيز المعاينة...\n{url}")
+            try:
+                await build_and_send_preview(
+                    event.chat_id, filename, info.get("title") or "", operation,
+                    cancel_event, int(info.get("duration") or 0),
+                )
+            except Exception as e:
+                if str(e) == CANCELLED_MARKER:
+                    raise
+                logger.exception("تعذر تجهيز المعاينة - نكمل بإرسال الفيديو")
+                await safe_send(
+                    event.chat_id, "⚠️ تعذر تجهيز المعاينة، بيوصلك الفيديو بدونها."
+                )
+            operation["stage"] = "downloading"
 
         gif_length = 0
         if as_gif:
@@ -1857,16 +2820,14 @@ async def main():
     global SELF_ENTITY
     SELF_ENTITY = await client.get_me()
     is_premium = apply_account_limits(SELF_ENTITY)
+    await load_preview_settings()
     logger.info(
         f"نوع الحساب: {'Premium' if is_premium else 'عادي'} | أقصى حجم للملف: "
         f"{MAX_FILE_SIZE // (1024 * 1024)} ميجا | أقصى عمليات متزامنة: "
         f"{MAX_CONCURRENT_JOBS}"
     )
-    if GROUP_CHAT_ID and not ALLOWED_USER_IDS:
-        logger.warning(
-            "GROUP_CHAT_ID مضبوط بدون ALLOWED_USER_IDS - أي عضو بالمجموعة "
-            "يقدر يشغّل البوت. يُنصح بتحديد أرقامك بـ ALLOWED_USER_IDS."
-        )
+    if GROUP_REQUESTED and not GROUP_CHAT_ID:
+        logger.warning("المجموعة الخاصة معطّلة (راجع خطأ GROUP_CHAT_ID أعلاه) - البوت يعمل بـ Saved Messages فقط")
     if GROUP_CHAT_ID:
         logger.info(
             f"البوت (Telethon) يعمل الآن... أرسل رابطًا في Saved Messages "
