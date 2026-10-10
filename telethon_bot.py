@@ -65,11 +65,18 @@
 
 المعاينة (GIF يلخّص الفيديو من بدايته لنهايته بـ 4 مقاطع على الأقل):
 - معاينة: قائمة الأوامر | تفعيل المعاينة / تعطيل المعاينة
-- دقة المعاينة (6 مستويات) | مدة المعاينة (5-180 ثانية أو تلقائي)
+- دقة المعاينة (5 مستويات) | مدة المعاينة (5-180 ثانية أو تلقائي)
 - الرابط معاينة: المعاينة فقط بدون الفيديو
 - الإعدادات تُحفظ بشكل دائم برسالة داخل Saved Messages (لا تحذفها).
 - اختيار ذكي للمقاطع بـ FFmpeg: يتجنب اللقطات السوداء/الثابتة/المكررة
   (PREVIEW_SMART_PICK=0 يعطّله).
+
+ترجمة كلام الفيديو للعربية (ملف SRT + فيديو بترجمة مدموجة، ملف translator.py):
+- الرابط ترجمة: يحمّل الفيديو ويفرّغ كلامه ويترجمه (أي لغة ← عربي) بتوقيت مزامن.
+- رد بكلمة ترجمة على أي فيديو بالمحادثة، أو أرسل فيديو ووصفه ترجمة.
+- يحتاج GROQ_API_KEY (مجاني من console.groq.com). متغيرات اختيارية:
+  TRANSLATE_MAX_MINUTES / TRANSLATE_MAX_INPUT_MB / TRANSLATE_BURN /
+  TRANSLATE_BURN_HEIGHT / TRANSLATE_BURN_MAX_MINUTES / TRANSLATE_LLM_MODEL ...
 """
 
 import asyncio
@@ -106,6 +113,8 @@ from telethon.tl.types import (
 )
 from telethon.errors import FloodWaitError, MessageNotModifiedError
 import yt_dlp
+
+import translator
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -213,6 +222,9 @@ GIF_REGEX = re.compile(r"(?i)(?<![\w])(gif|جيف)(?![\w])")
 PREVIEW_REGEX = re.compile(r"(?i)(?<![\w])(معاين[ةه]|preview)(?![\w])")
 # كلمة mp3 / صوت / audio → تحميل الصوت فقط
 AUDIO_REGEX = re.compile(r"(?i)(?<![\w])(mp3|audio|صوت)(?![\w])")
+# كلمة ترجمة / translate → ترجمة كلام الفيديو للعربية (SRT + فيديو مترجم)
+TRANSLATE_REGEX = re.compile(r"(?i)(?<![\w])(ترجم[ةه]?|translate)(?![\w])")
+TRANSLATE_CMD_PATTERN = r"(?i)^(ترجم[ةه]?|translate)$"
 # مدى القص: 10-20 أو 1:30-1:45 (نمنع الالتصاق بـ - أو : أو . أو حرف، عشان
 # التواريخ مثل 2026-09-24 ما تنحسب كمدى قص بالغلط)
 _TIME = r"\d{1,5}(?::\d{1,2}){0,2}"
@@ -415,17 +427,7 @@ PREVIEW_LEVELS = {
     3: {"name": "متوسطة", "scale": 0.5, "fps": 20, "crf": 26},
     4: {"name": "أقل من متوسطة", "scale": 0.35, "fps": 16, "crf": 28},
     5: {"name": "ضعيفة", "scale": 0.25, "fps": 12, "crf": 30},
-    # ⚡ الأسرع: قص المقاطع ولصقها بـ -c copy بدون أي إعادة ترميز (ثواني بدل
-    # دقائق على Render المجاني). دقة المعاينة = دقة الملف نفسه، والمقاطع
-    # تبدأ من أقرب إطار مفتاحي قبل الموقع المخطَّط (فقد تزيد مدتها قليلًا).
-    6: {"name": "⚡ سريعة جدًا (بدون إعادة ترميز)", "scale": 1.0, "fps": 0, "crf": 0, "copy": True},
 }
-# لو المصدر مو H.264 (مثل VP9/AV1) ما ينفع نسخه مباشرة لـ mp4 يعرضه تيليجرام،
-# فنرمّزه بدقة هذا المستوى (الأسرع بين مستويات الترميز)
-PREVIEW_COPY_FALLBACK_LEVEL = 5
-# تحميل "الرابط معاينة" بالمستوى السريع: أقل ارتفاع ≥ هذا (النسخ يحافظ على دقة
-# الملف المُحمَّل، فما نحمّل أعلى جودة بلا داعي)
-PREVIEW_COPY_TARGET_HEIGHT = 480
 # الإعدادات الحالية (تُحمَّل من الرسالة المحفوظة وقت التشغيل)
 preview_settings = {"enabled": False, "level": 3, "seconds": 0}  # seconds=0 → تلقائي
 preview_store_msg_id = None
@@ -508,24 +510,11 @@ def preview_scale_factor(level: int, long_side: int = 0, override=None) -> float
 
 
 def pick_preview_download(probe: dict, level: int):
-    """لوضع "المعاينة فقط": نحدد أقل صيغة فيديو تكفي لدقة المعاينة
+    """لوضع \"المعاينة فقط\": نحدد أقل صيغة فيديو تكفي لدقة المعاينة
     المطلوبة (بدل تحميل أعلى جودة كاملة) توفيرًا للباندويدث.
-    يرجّع (format_selector، نسبة التصغير بالنسبة للملف المُحمَّل).
-    المستوى السريع (copy): الدقة = دقة الملف المُحمَّل، فنحمّل أقل ارتفاع
-    ≥ PREVIEW_COPY_TARGET_HEIGHT مع تفضيل H.264 (avc1) لأنه الوحيد اللي ينسخ
-    مباشرة لـ mp4."""
-    params = PREVIEW_LEVELS.get(level, PREVIEW_LEVELS[3])
+    يرجّع (format_selector، نسبة التصغير بالنسبة للملف المُحمَّل)."""
+    factor = PREVIEW_LEVELS.get(level, PREVIEW_LEVELS[3])["scale"]
     heights = sorted(probe.get("heights") or [], reverse=True)
-    if params.get("copy"):
-        if not heights:
-            return "bestvideo[vcodec^=avc1]/bestvideo/best", None
-        candidates = [h for h in heights if h >= PREVIEW_COPY_TARGET_HEIGHT]
-        chosen = min(candidates) if candidates else heights[0]
-        return (
-            f"bestvideo[height<={chosen}][vcodec^=avc1]/bestvideo[height<={chosen}]"
-            f"/best[height<={chosen}]/best"
-        ), None
-    factor = params["scale"]
     if not heights:
         return "bestvideo/best", None
     top = heights[0]
@@ -558,7 +547,7 @@ def probe_media(path: str) -> dict:
             [
                 "ffprobe", "-v", "error", *_remote_input_opts(path),
                 "-select_streams", "v:0",
-                "-show_entries", "stream=codec_name,width,height:format=duration",
+                "-show_entries", "stream=width,height:format=duration",
                 "-of", "json", path,
             ],
             capture_output=True, timeout=30,
@@ -570,7 +559,6 @@ def probe_media(path: str) -> dict:
             "width": _num(stream.get("width"), int),
             "height": _num(stream.get("height"), int),
             "duration": _num(fmt.get("duration"), float),
-            "codec": (stream.get("codec_name") or "").lower(),
         }
     except Exception:
         logger.exception("تعذر قراءة بيانات الملف عبر ffprobe")
@@ -775,19 +763,9 @@ def make_preview(
         except Exception:
             logger.exception("خطأ بالاختيار الذكي للمعاينة - استُخدمت المواقع المخطَّطة")
 
-    params = PREVIEW_LEVELS.get(level, PREVIEW_LEVELS[3])
-    copy_mode = bool(params.get("copy"))
-    copy_fallback = False
-    if copy_mode and info.get("codec") != "h264":
-        # النسخ المباشر ينفع فقط مع H.264؛ غيره (VP9/AV1/HEVC...) نرمّزه
-        # بأسرع مستوى ترميز بدل ما ننتج ملف ما يعرضه تيليجرام
-        logger.info(f"المصدر ({info.get('codec') or 'مجهول'}) مو H.264 - ترميز بدل النسخ المباشر")
-        level = PREVIEW_COPY_FALLBACK_LEVEL
-        params = PREVIEW_LEVELS[level]
-        copy_mode, copy_fallback = False, True
-        scale_override = None
     long_side = max(info.get("width", 0), info.get("height", 0))
     factor = preview_scale_factor(level, long_side, scale_override)
+    params = PREVIEW_LEVELS.get(level, PREVIEW_LEVELS[3])
     # scale بالنسبة المئوية من أبعاد الإطار الفعلية (يشتغل صح مع الفيديو
     # العمودي/المدوّر) مع جعل الأبعاد زوجية (شرط H.264)
     vf = (
@@ -803,20 +781,8 @@ def make_preview(
 
     try:
         for i, (start, length) in enumerate(segments):
-            if copy_mode:
-                # نسخ بدون ترميز: -noaccurate_seek يبدأ من أقرب إطار مفتاحي
-                # قبل الموقع بدون إطارات "مخفية" (تضمن لصقًا نظيفًا بدون
-                # قفزات). الثمن: المقطع قد يزيد قليلًا عن الطول المطلوب.
-                cmd = [
-                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                    *_remote_input_opts(filepath),
-                    "-noaccurate_seek", "-ss", f"{start:.2f}", "-i", filepath,
-                    "-t", f"{length:.2f}", "-an", "-c:v", "copy",
-                    "-avoid_negative_ts", "make_zero",
-                    seg_paths[i],
-                ]
-            else:
-                cmd = [
+            _run_ffmpeg(
+                [
                     "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                     *_remote_input_opts(filepath),
                     "-ss", f"{start:.2f}", "-i", filepath,
@@ -824,40 +790,9 @@ def make_preview(
                     "-c:v", "libx264", "-preset", "veryfast",
                     "-crf", str(params["crf"]), "-pix_fmt", "yuv420p",
                     seg_paths[i],
-                ]
-            _run_ffmpeg(cmd, cancel_event, PREVIEW_SEGMENT_TIMEOUT)
-            if copy_mode and os.path.exists(seg_paths[i]):
-                # المصادر ذات الإطارات المفتاحية المتباعدة (GOP طويل) تنتج مقطعًا
-                # أطول بكثير من المطلوب (يبدأ من المفتاحي السابق). لو زاد الطول
-                # بوضوح، نعيد القص من نفس الإطار المفتاحي بطول مضبوط، فتبقى مدة
-                # المعاينة قريبة من المطلوب بدل ما تتضاعف.
-                seg_dur = probe_media(seg_paths[i]).get("duration") or 0
-                if seg_dur > length * 1.5 + 0.5:
-                    key_t = max(0.0, start - (seg_dur - length)) + 0.15  # تحيّز للأعلى عشان نبقى على نفس المفتاحي
-                    retry_path = seg_paths[i] + ".r.mp4"
-                    try:
-                        _run_ffmpeg(
-                            [
-                                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                                *_remote_input_opts(filepath),
-                                "-noaccurate_seek", "-ss", f"{key_t:.2f}", "-i", filepath,
-                                "-t", f"{length:.2f}", "-an", "-c:v", "copy",
-                                "-avoid_negative_ts", "make_zero",
-                                retry_path,
-                            ],
-                            cancel_event, PREVIEW_SEGMENT_TIMEOUT,
-                        )
-                        if os.path.exists(retry_path) and os.path.getsize(retry_path) > 0:
-                            os.replace(retry_path, seg_paths[i])
-                    except RuntimeError as e:
-                        if str(e) == CANCELLED_MARKER:
-                            raise
-                        logger.warning(f"تعذر ضبط طول مقطع المعاينة (نبقي الأصلي): {str(e)[:100]}")
-                    finally:
-                        try:
-                            os.remove(retry_path)
-                        except OSError:
-                            pass
+                ],
+                cancel_event, PREVIEW_SEGMENT_TIMEOUT,
+            )
             if not os.path.exists(seg_paths[i]) or os.path.getsize(seg_paths[i]) == 0:
                 raise RuntimeError("تعذر استخراج أحد مقاطع المعاينة")
             if progress:
@@ -895,8 +830,6 @@ def make_preview(
         "segments": len(segments),
         "adjusted": adjusted,
         "size": os.path.getsize(out_path),
-        "copy": copy_mode,
-        "fallback": copy_fallback,
     }
 
 
@@ -999,6 +932,7 @@ def record_finished(op: dict, outcome: str, detail: str = ""):
         "finished_at": time.monotonic(),
     })
 CANCELLED_MARKER = "USER_CANCELLED_OPERATION"
+assert translator.CANCELLED_MARKER == CANCELLED_MARKER  # نفس علامة الإلغاء بالوحدتين
 
 # إحصائيات بسيطة تُحفظ بالذاكرة فقط (تصفر عند أي إعادة تشغيل) - تساعدك
 # تتابع استهلاكك من حصة الباندويدث الشهرية عند Render (100 جيجا مجانًا)
@@ -1604,10 +1538,6 @@ async def build_and_send_preview(
             f"\n📥 قُرئ من تيليجرام {format_size(s['fetched'])} من "
             f"{format_size(s['size'])} (بدون تنزيل كامل)"
         )
-    if result.get("copy"):
-        caption += "\n⚡ نسخ مباشر بدون إعادة ترميز"
-    elif result.get("fallback"):
-        caption += "\n⚠️ صيغة الفيديو ما تسمح بالنسخ المباشر (مو H.264) فتم ترميزها بدقة ضعيفة"
     operation["stage"] = "uploading"
     await send_bot_file(
         chat_id,
@@ -1664,9 +1594,7 @@ def build_level_prompt() -> str:
         mark = " ✅ (الحالية)" if num == current else ""
         lines.append(f"{num}. {params['name']}{mark}")
     lines.append(
-        "\n(الدقة نسبة من دقة كل فيديو نفسه، وما تتجاوز دقة الملف المحمّل)\n"
-        "(⚡ المستوى 6: أسرع بكثير - قص ولصق بدون ترميز، بدقة الفيديو الأصلية "
-        "وحجم أكبر، ومدة المقاطع قد تزيد قليلًا)"
+        "\n(الدقة نسبة من دقة كل فيديو نفسه، وما تتجاوز دقة الملف المحمّل)"
     )
     return "\n".join(lines)
 
@@ -1814,6 +1742,8 @@ async def handle_uploaded_preview(event):
 
     caption = event.raw_text or ""
     caption_no_urls = URL_REGEX.sub(" ", caption)
+    if TRANSLATE_REGEX.search(caption_no_urls):
+        return  # كلمة ترجمة بالوصف: لها معالجها الخاص (handle_uploaded_translate)
     asked = bool(PREVIEW_REGEX.search(caption_no_urls))
     if not (asked or preview_settings["enabled"]):
         return
@@ -1939,6 +1869,233 @@ async def handle_uploaded_preview(event):
         if operation in active_operations:
             active_operations.remove(operation)
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ======================================================================
+# ترجمة كلام الفيديو للعربية (SRT + فيديو بترجمة مدموجة) - المنطق بـ translator.py
+# ======================================================================
+async def run_translation_job(
+    chat_id, src_path: str, title: str, duration: float, operation: dict,
+    cancel_event, status, burn_height=None, burn=None, reply_to=None,
+):
+    """يشغّل خط الترجمة على فيديو محلي ثم يرسل ملف SRT أولًا (يوصلك النص
+    حتى لو فشل رفع الفيديو) وبعده الفيديو المترجم. يرفع UserFacingError
+    برسالة عربية لأخطاء الترجمة المفهومة. المستدعي مسؤول عن الطابور
+    (job_slots) وتنظيف operation['tmp_dir']."""
+    operation["stage"] = "converting"
+    operation["percent"] = 0.0
+    work_dir = tempfile.mkdtemp(prefix="tr_", dir=operation["tmp_dir"])
+
+    async def on_progress(text, pct):
+        operation["percent"] = pct
+        await safe_edit(status, f"{text}\n\n(أرسل \"الغاء\" لإيقاف العملية)")
+
+    try:
+        result = await translator.translate_video(
+            src_path, work_dir, title or "video", cancel_event=cancel_event,
+            on_progress=on_progress, burn=burn, burn_height=burn_height,
+            duration_hint=duration,
+        )
+    except translator.TranslateError as e:
+        raise UserFacingError(str(e))
+
+    operation["stage"] = "uploading"
+    operation["percent"] = 0.0
+    await safe_edit(status, "📤 جاري إرسال الترجمة...")
+
+    caption = (
+        f"🌐 ترجمة عربية · {result['cues']} شاشة · "
+        f"اللغة الأصلية: {result['language_ar']}"
+    )
+    if result["untranslated"]:
+        caption += f"\n⚠️ {result['untranslated']} جملة ما انترجمت وبقيت بلغتها الأصلية"
+    if result["used_fallback"]:
+        caption += "\nℹ️ استُخدم نموذج ترجمة احتياطي (حصة النموذج الأساسي خلصت)"
+    await send_bot_file(
+        chat_id, result["srt_path"], caption=caption, force_document=True,
+        reply_to=reply_to,
+    )
+
+    vpath = result["video_path"]
+    note = result["burn_note"]
+    if vpath:
+        vsize = os.path.getsize(vpath)
+        if vsize > MAX_FILE_SIZE:
+            note = "الفيديو المترجم أكبر من حد الإرسال، وهذا ملف الترجمة."
+        else:
+            meta = await asyncio.to_thread(probe_media, vpath)
+            thumb = await asyncio.to_thread(
+                generate_thumbnail, vpath, meta.get("duration") or duration or 0
+            )
+
+            def upload_progress(current: int, total: int):
+                if cancel_event.is_set():
+                    raise RuntimeError(CANCELLED_MARKER)
+                if total > 0:
+                    operation["percent"] = current / total * 100
+
+            await safe_edit(status, "📤 جاري إرسال الفيديو المترجم...")
+            await send_bot_file(
+                chat_id, vpath,
+                caption=f"🎬 {title}\n🌐 مترجم للعربية · 📦 {format_size(vsize)}".strip()[:1000],
+                attributes=[DocumentAttributeVideo(
+                    duration=int(meta.get("duration") or duration or 0),
+                    w=meta.get("width") or 640, h=meta.get("height") or 360,
+                    supports_streaming=True,
+                )],
+                thumb=thumb, supports_streaming=True, reply_to=reply_to,
+                progress_callback=upload_progress,
+            )
+            stats["total_bytes_sent"] += vsize
+    if note:
+        await safe_send(chat_id, f"ℹ️ {note}")
+
+
+async def translate_video_message(event, source_msg):
+    """يترجم فيديو (أو ملف صوت) موجود برسالة تيليجرام: ينزّله، يترجمه،
+    ويرسل النتيجة كرد عليه."""
+    if not translator.is_configured():
+        await safe_respond(event, "⚠️ " + translator.SETUP_HINT)
+        return
+    doc = source_msg.document
+    mime = (getattr(doc, "mime_type", "") or "") if doc is not None else ""
+    is_audio = mime.startswith("audio/")
+    if doc is None or not (mime.startswith("video/") or is_audio) or source_msg.gif:
+        await safe_respond(
+            event, "⚠️ الترجمة تشتغل على فيديو (أو ملف صوت). رد بكلمة `ترجمة` على الفيديو نفسه."
+        )
+        return
+    if doc.size and doc.size > translator.MAX_INPUT_MB * 1024 * 1024:
+        await safe_respond(
+            event,
+            f"⚠️ حجم الملف {format_size(doc.size)} أكبر من الحد "
+            f"{translator.MAX_INPUT_MB} ميجا للترجمة (يتغير بمتغير TRANSLATE_MAX_INPUT_MB).",
+        )
+        return
+    attr = next(
+        (a for a in doc.attributes
+         if isinstance(a, (DocumentAttributeVideo, DocumentAttributeAudio))), None
+    )
+    duration = int(getattr(attr, "duration", 0) or 0)
+    if duration and duration > translator.MAX_MINUTES * 60:
+        await safe_respond(
+            event,
+            f"⚠️ الفيديو ({duration // 60} دقيقة) أطول من الحد {translator.MAX_MINUTES} "
+            "دقيقة للترجمة (يتغير بمتغير TRANSLATE_MAX_MINUTES).",
+        )
+        return
+    fname = getattr(getattr(source_msg, "file", None), "name", None) or ""
+    title = os.path.splitext(fname)[0] or "video"
+
+    status = await safe_respond(event, "🌐 جاري تجهيز الترجمة...\n(أرسل \"الغاء\" للإيقاف)")
+    tmp_dir = tempfile.mkdtemp(prefix="ytdlp_")
+    cancel_event = threading.Event()
+    operation = {
+        "cancel_event": cancel_event,
+        "url": "فيديو مرسل ← ترجمة",
+        "tmp_dir": tmp_dir,
+        "stage": "queued",
+        "percent": 0.0,
+        "started": time.monotonic(),
+    }
+    active_operations.append(operation)
+
+    def download_progress(current: int, total: int):
+        if cancel_event.is_set():
+            raise RuntimeError(CANCELLED_MARKER)
+        if total:
+            operation["percent"] = current / total * 100
+
+    slot_held = False
+    try:
+        await acquire_job_slot(status, "فيديو مرسل ← ترجمة", cancel_event)
+        slot_held = True
+        operation["stage"] = "downloading"
+        await safe_edit(status, "📥 جاري تنزيل الفيديو للترجمة...\n(أرسل \"الغاء\" للإيقاف)")
+        src_path = await client.download_media(
+            source_msg, file=tmp_dir, progress_callback=download_progress
+        )
+        if not src_path or not os.path.exists(src_path):
+            raise FileNotFoundError("تعذر تنزيل الفيديو")
+        await run_translation_job(
+            event.chat_id, src_path, title, duration, operation, cancel_event,
+            status, burn=False if is_audio else None, reply_to=source_msg.id,
+        )
+        stats["completed_downloads"] += 1
+        record_finished(operation, "done")
+        if status is not None:
+            try:
+                await status.delete()
+            except FloodWaitError:
+                pass
+    except UserFacingError as e:
+        stats["failed_downloads"] += 1
+        record_finished(operation, "failed", str(e)[:150])
+        await safe_edit(status, f"⚠️ {e}")
+    except RecursionError:
+        stats["failed_downloads"] += 1
+        logger.exception("RecursionError أثناء ترجمة فيديو مرسل")
+        record_finished(operation, "failed", "خطأ داخلي (تكرار)")
+        await safe_edit(status, "❌ حدث خطأ داخلي غير متوقع أثناء الترجمة.")
+    except RuntimeError as e:
+        if str(e) == CANCELLED_MARKER:
+            record_finished(operation, "cancelled")
+            await safe_edit(status, "🛑 تم إلغاء الترجمة.")
+        else:
+            stats["failed_downloads"] += 1
+            logger.exception("فشل ترجمة فيديو مرسل")
+            record_finished(operation, "failed", str(e)[:150])
+            await safe_edit(status, f"❌ تعذرت الترجمة: {str(e)[:150]}")
+    except Exception as e:
+        stats["failed_downloads"] += 1
+        logger.exception("خطأ غير متوقع أثناء ترجمة فيديو مرسل")
+        record_finished(operation, "failed", str(e)[:150])
+        await safe_edit(status, f"❌ حدث خطأ غير متوقع: {str(e)[:150]}")
+    finally:
+        if slot_held:
+            job_slots.release()
+        if operation in active_operations:
+            active_operations.remove(operation)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=TRANSLATE_CMD_PATTERN))
+async def handle_translate_command(event):
+    """رد بكلمة `ترجمة` على أي فيديو بالمحادثة (حتى اللي أرسله البوت نفسه)."""
+    if not is_allowed_trigger(event):
+        return
+    reply = await event.get_reply_message() if event.is_reply else None
+    if reply is None:
+        await safe_respond(
+            event,
+            "ℹ️ لترجمة فيديو للعربية:\n"
+            "• رد بكلمة `ترجمة` على الفيديو\n"
+            "• أو أرسل `الرابط ترجمة`\n"
+            "• أو أرسل الفيديو ووصفه `ترجمة`",
+        )
+        return
+    await translate_video_message(event, reply)
+
+
+@client.on(events.NewMessage(chats=ALLOWED_CHATS))
+async def handle_uploaded_translate(event):
+    """فيديو مرسل ووصفه (caption) فيه كلمة ترجمة → يترجمه."""
+    if not is_allowed_trigger(event):
+        return
+    msg = event.message
+    doc = msg.document
+    if doc is None:
+        return
+    mime = getattr(doc, "mime_type", "") or ""
+    if not mime.startswith("video/") or msg.gif or msg.video_note:
+        return
+    caption_no_urls = URL_REGEX.sub(" ", event.raw_text or "")
+    if not TRANSLATE_REGEX.search(caption_no_urls):
+        return
+    await asyncio.sleep(2.5)  # عشان رقم رسالة البوت نفسه (لو هو المرسل) يتسجل أول
+    if (event.chat_id, msg.id) in bot_sent_ids:
+        return
+    await translate_video_message(event, msg)
 
 
 @client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=r"(?i)^(الغاء|إلغاء|cancel|stop)$"))
@@ -2207,9 +2364,15 @@ def build_help_text() -> str:
         "🖼️ **المعاينة** (GIF يلخّص الفيديو من بدايته لنهايته)\n"
         "• `معاينة` → قائمة أوامر المعاينة وحالتها\n"
         "• `تفعيل المعاينة` / `تعطيل المعاينة` → مع كل فيديو يتحمّل أو يُرسل للبوت\n"
-        "• `دقة المعاينة` → اختيار الدقة من 6 مستويات (محفوظة بشكل دائم)\n"
+        "• `دقة المعاينة` → اختيار الدقة من 5 مستويات (محفوظة بشكل دائم)\n"
         f"• `مدة المعاينة` → من {PREVIEW_MIN_SECONDS} إلى {PREVIEW_MAX_SECONDS} ثانية أو تلقائي\n"
         "• `الرابط معاينة` → المعاينة فقط بدون الفيديو\n\n"
+        "🌐 **ترجمة كلام الفيديو للعربية** (ملف SRT + فيديو مترجم)\n"
+        "• `الرابط ترجمة` → يحمّل الفيديو ويترجم كلامه (أي لغة ← عربي) بتوقيت مزامن\n"
+        "• رد بكلمة `ترجمة` على أي فيديو بالمحادثة، أو أرسل فيديو ووصفه `ترجمة`\n"
+        f"• حتى {translator.MAX_MINUTES} دقيقة للترجمة، ودمجها بالفيديو لغاية "
+        f"{translator.BURN_MAX_MINUTES} دقائق (بعدها يرسل ملف SRT فقط)\n"
+        "• تحتاج مفتاح مجاني `GROQ_API_KEY` من console.groq.com\n\n"
         "**أوامر التحكم:**\n"
         "• `الغاء` - يوقف أي تحميل شغّال أو ينتظر بالطابور\n"
         "• `تنظيف` - يمسح الملفات المؤقتة المتراكمة\n"
@@ -2265,6 +2428,14 @@ def build_settings_text() -> str:
         f"• `PREVIEW_STREAM_MIN_MB` = {PREVIEW_STREAM_MIN_MB} - الملفات الأصغر تُنزَّل كاملة\n"
         f"• `PREVIEW_STREAM_SMART` = {'مفعّل ✅' if PREVIEW_STREAM_SMART else 'معطّل ⛔'} - "
         "الاختيار الذكي مع البث (يقرأ بيانات أكثر)\n\n"
+        "**الترجمة للعربية:**\n"
+        f"• `GROQ_API_KEY` = {'مضبوط ✅' if translator.is_configured() else 'غير مضبوط ⛔ (ضروري للترجمة)'}\n"
+        f"• `TRANSLATE_MAX_MINUTES` = {translator.MAX_MINUTES} · "
+        f"`TRANSLATE_MAX_INPUT_MB` = {translator.MAX_INPUT_MB}\n"
+        f"• `TRANSLATE_BURN` = {'مفعّل ✅' if translator.BURN_DEFAULT else 'معطّل ⛔'} · "
+        f"`TRANSLATE_BURN_HEIGHT` = {translator.BURN_HEIGHT} · "
+        f"`TRANSLATE_BURN_MAX_MINUTES` = {translator.BURN_MAX_MINUTES}\n"
+        "• `TRANSLATE_STT_MODEL` / `TRANSLATE_LLM_MODEL` - نماذج التفريغ والترجمة\n\n"
         "**الأمان والمجموعة:**\n"
         f"• `GROUP_CHAT_ID` = {group_line} - "
         "المجموعة الخاصة لأرقامك الثانية\n"
@@ -2321,6 +2492,8 @@ async def handle_uploaded_video(event):
 
     caption = event.raw_text or ""
     caption_no_urls = URL_REGEX.sub(" ", caption)
+    if TRANSLATE_REGEX.search(caption_no_urls):
+        return  # كلمة ترجمة بالوصف: لها معالجها الخاص (handle_uploaded_translate)
     in_mode = is_gif_mode(event.chat_id)
     if not in_mode and not GIF_REGEX.search(caption_no_urls):
         return
@@ -2531,12 +2704,19 @@ async def handle_message(event):
     text_no_urls = URL_REGEX.sub(" ", text)
     # كلمة mp3/صوت صريحة تتغلب على وضع GIF (طلب صوت فقط لهذا الرابط)
     # كلمة معاينة/preview = المعاينة فقط بدون الفيديو (تتغلب على gif/mp3)
-    as_preview = bool(PREVIEW_REGEX.search(text_no_urls))
-    as_audio = bool(AUDIO_REGEX.search(text_no_urls)) and not as_preview
+    # كلمة ترجمة تتغلب على كل شي ثاني (gif/mp3/معاينة) لهذا الرابط
+    as_translate = bool(TRANSLATE_REGEX.search(text_no_urls))
+    as_preview = bool(PREVIEW_REGEX.search(text_no_urls)) and not as_translate
+    as_audio = (
+        bool(AUDIO_REGEX.search(text_no_urls)) and not as_preview and not as_translate
+    )
     as_gif = (
         (bool(GIF_REGEX.search(text_no_urls)) or is_gif_mode(chat_id))
-        and not as_audio and not as_preview
+        and not as_audio and not as_preview and not as_translate
     )
+    if as_translate and not translator.is_configured():
+        await safe_respond(event, "⚠️ " + translator.SETUP_HINT)
+        return
     if as_gif and is_gif_mode(chat_id):
         touch_gif_mode(chat_id)
 
@@ -2559,7 +2739,9 @@ async def handle_message(event):
         await safe_respond(event, f"📋 لقيت {len(urls)} روابط، رح أعالجهم بالترتيب...")
 
     for url in urls:
-        await process_single_url(event, url, quality, as_gif, clip, as_audio, as_preview)
+        await process_single_url(
+            event, url, quality, as_gif, clip, as_audio, as_preview, as_translate
+        )
 
 
 def build_probe_ydl_opts() -> dict:
@@ -2739,12 +2921,13 @@ async def process_single_url(
     clip=None,
     as_audio: bool = False,
     as_preview: bool = False,
+    as_translate: bool = False,
 ):
     """يحمّل رابط واحد ويرسله، مع تحديث حي لنسبة التقدم بنفس الرسالة.
     quality: أعلى ارتفاع مسموح (مثل 720)، أو None لأعلى جودة متوفرة
     (لو None، يسأل المستخدم أولاً عن الجودات الحقيقية المتوفرة - إلا
     لو فيه جودة وحدة بس متوفرة، بهالحالة ما فيه داعي نسأل)."""
-    if quality is None and not as_gif and not as_audio and not as_preview:
+    if quality is None and not as_gif and not as_audio and not as_preview and not as_translate:
         try:
             probe = await asyncio.to_thread(probe_formats, url)
         except Exception:
@@ -2774,6 +2957,8 @@ async def process_single_url(
         quality_label += " 🎵 (صوت فقط)"
     elif as_preview:
         quality_label += " 🖼️ (معاينة فقط)"
+    elif as_translate:
+        quality_label += " 🌐 (ترجمة للعربية)"
     status = await safe_respond(event, 
         f"⏳ جاري التحميل...{quality_label} 0%\n{url}\n\n"
         "(أرسل \"الغاء\" لإيقاف هذا التحميل)"
@@ -2841,6 +3026,11 @@ async def process_single_url(
     if as_audio:
         # صوت فقط: نطلب أفضل مسار صوت (أو أفضل صيغة لو الموقع ما يفصل)
         fmt = "bestaudio/best"
+    elif as_translate:
+        # الترجمة: ما نحتاج جودة عالية (الصوت هو المهم، والفيديو المترجم
+        # أصلًا يُصغَّر لـ TRANSLATE_BURN_HEIGHT) - نوفّر الباندويدث.
+        cap = quality or translator.BURN_HEIGHT
+        fmt = f"bestvideo[height<={cap}]+bestaudio/best[height<={cap}]/best"
     elif as_preview:
         # المعاينة فقط: فيديو بدون صوت، والدقة المناسبة تُحدَّد بعد استعلام
         # الجودات داخل try (pick_preview_download) توفيرًا للباندويدث
@@ -2975,6 +3165,22 @@ async def process_single_url(
 
         if not os.path.exists(filename):
             raise FileNotFoundError("تعذر إيجاد الملف بعد التحميل")
+
+        # ---- الترجمة ----
+        if as_translate:
+            await run_translation_job(
+                event.chat_id, filename, info.get("title") or "",
+                int(info.get("duration") or 0), operation, cancel_event, status,
+                burn_height=quality,
+            )
+            stats["completed_downloads"] += 1
+            record_finished(operation, "done")
+            if status is not None:
+                try:
+                    await status.delete()
+                except FloodWaitError:
+                    pass
+            return
 
         # ---- المعاينة ----
         if as_preview:
@@ -3225,6 +3431,10 @@ async def main():
     SELF_ENTITY = await client.get_me()
     is_premium = apply_account_limits(SELF_ENTITY)
     await load_preview_settings()
+    logger.info(
+        "ميزة ترجمة الفيديو: "
+        + ("جاهزة ✅" if translator.is_configured() else "غير مفعّلة (اضبط GROQ_API_KEY)")
+    )
     logger.info(
         f"نوع الحساب: {'Premium' if is_premium else 'عادي'} | أقصى حجم للملف: "
         f"{MAX_FILE_SIZE // (1024 * 1024)} ميجا | أقصى عمليات متزامنة: "
