@@ -65,7 +65,7 @@
 
 المعاينة (GIF يلخّص الفيديو من بدايته لنهايته بـ 4 مقاطع على الأقل):
 - معاينة: قائمة الأوامر | تفعيل المعاينة / تعطيل المعاينة
-- دقة المعاينة (5 مستويات) | مدة المعاينة (5-40 ثانية أو تلقائي)
+- دقة المعاينة (5 مستويات) | مدة المعاينة (5-180 ثانية أو تلقائي)
 - الرابط معاينة: المعاينة فقط بدون الفيديو
 - الإعدادات تُحفظ بشكل دائم برسالة داخل Saved Messages (لا تحذفها).
 - اختيار ذكي للمقاطع بـ FFmpeg: يتجنب اللقطات السوداء/الثابتة/المكررة
@@ -369,9 +369,9 @@ GIF_MAX_INPUT_MB = _env_int("GIF_MAX_INPUT_MB", 200, 1)
 # الإعدادات (التفعيل/الدقة/المدة) مستقلة تمامًا عن جودة الفيديو المختارة،
 # وتُحفظ بشكل دائم بالرسالة المثبّتة بـ Saved Messages (راجع save_preview_settings).
 PREVIEW_MIN_SECONDS = 5
-PREVIEW_MAX_SECONDS = 40
+PREVIEW_MAX_SECONDS = 180
 PREVIEW_MIN_SEGMENTS = 4
-PREVIEW_MAX_SEGMENTS = 12
+PREVIEW_MAX_SEGMENTS = 24
 PREVIEW_SEGMENT_TARGET = 2.5  # الطول المثالي للمقطع الواحد بالثواني
 PREVIEW_MIN_SIDE = 240        # أقل طول للضلع الأطول (ما نصغّر أكثر من هذا)
 PREVIEW_SEGMENT_TIMEOUT = 300  # مهلة ترميز المقطع الواحد (ثانية) - Render المجاني بطيء
@@ -445,14 +445,20 @@ def sanitize_preview_settings(data) -> dict:
 
 
 def auto_preview_seconds(duration: float) -> int:
-    """مدة المعاينة التلقائية حسب طول الفيديو (15–30 ثانية)."""
+    """مدة المعاينة التلقائية حسب طول الفيديو (من 20 ثانية إلى 3 دقائق):
+    حتى دقيقتين → 20 ث | حتى 10 د → 30 ث | حتى 30 د → 45 ث |
+    حتى ساعة → دقيقة | حتى ساعتين → دقيقتان | أكثر → 3 دقائق."""
     if duration <= 120:
-        return 15
-    if duration <= 600:
         return 20
+    if duration <= 600:
+        return 30
     if duration <= 1800:
-        return 25
-    return 30
+        return 45
+    if duration <= 3600:
+        return 60
+    if duration <= 7200:
+        return 120
+    return 180
 
 
 def plan_preview(duration: float, seconds_setting: int = 0):
@@ -639,7 +645,10 @@ def pick_clean_segments(
     deadline = time.monotonic() + PREVIEW_PROBE_BUDGET
     chosen, sigs, adjusted = [], [], 0
     consecutive_fails = 0
-    fractions = PREVIEW_SHIFT_FRACTIONS[:PREVIEW_MAX_CANDIDATES]
+    # مع المعاينات الطويلة (مقاطع كثيرة) نقلّل المرشّحين لكل مقطع عشان وقت
+    # التحليل ما يتضاعف على السيرفر الضعيف
+    max_cands = PREVIEW_MAX_CANDIDATES if n <= 12 else 3
+    fractions = PREVIEW_SHIFT_FRACTIONS[:max_cands]
 
     for i, (start, length) in enumerate(segments):
         step = (segments[i + 1][0] - start) if i + 1 < n else (start - segments[i - 1][0])
@@ -935,20 +944,70 @@ async def send_bot_file(chat_id, *args, **kwargs):
     return msg
 
 
-def generate_thumbnail(filepath: str):
-    """يولّد صورة مصغّرة (thumbnail) عبر ffmpeg فقط - أخف بكثير من قبل
-    لأننا صرنا نجيب المدة والأبعاد من yt-dlp نفسه بدل استدعاء ffprobe
-    كعملية منفصلة (توفير كامل لعملية subprocess زايدة).
-    كمان نضع -ss قبل -i (البحث من طرف الإدخال) بدل بعده: هذا يخلي ffmpeg
-    يقفز مباشرة لأقرب "keyframe" بدون فك تشفير كل الثواني اللي قبلها،
-    فايدة كبيرة بالسرعة والمعالج خصوصًا بالفيديوهات الطويلة، وبدون أي
-    تأثير على جودة الفيديو الأصلي (الصورة المصغّرة فقط للمعاينة)."""
+def _thumb_frame_quality(filepath: str, t: float):
+    """يقيّم إطارًا واحدًا عند الزمن t بـ ffmpeg (رمادي 48x48 خام): يرجّع
+    (متوسط السطوع، التباين) أو None لو تعذر."""
+    side = PREVIEW_PROBE_SIDE
+    out = _run_ffmpeg(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-ss", f"{max(0.0, t):.2f}", "-i", filepath, "-an", "-sn",
+            "-frames:v", "1", "-vf", f"scale={side}:{side}:flags=area,format=gray",
+            "-f", "rawvideo", "-pix_fmt", "gray", "-",
+        ],
+        None, 15, capture=True,
+    )
+    if len(out) < side * side:
+        return None
+    px = out[: side * side]
+    mean = sum(px) / len(px)
+    std = (sum((p - mean) ** 2 for p in px) / len(px)) ** 0.5
+    return mean, std
+
+
+def pick_thumbnail_time(filepath: str, duration: float = 0) -> float:
+    """يختار زمن صورة مصغّرة "حيّة" (مو سوداء ولا لون مسطّح): يجرّب الثانية 1
+    ثم نقاطًا موزّعة (10%/25%/50%/75%) ويأخذ أول إطار مقبول، أو الأفضل لو
+    ما فيه. أي خطأ → الثانية 1 (السلوك القديم)."""
+    try:
+        if not duration:
+            duration = probe_media(filepath).get("duration") or 0
+        times = [1.0]
+        if duration > 0:
+            times = [min(1.0, duration * 0.1)] + [duration * f for f in (0.1, 0.25, 0.5, 0.75)]
+        uniq = []
+        for t in times:
+            t = round(max(0.0, min(t, max(0.0, duration - 0.3))) if duration > 0 else t, 2)
+            if all(abs(t - u) > 0.5 for u in uniq):
+                uniq.append(t)
+        best = None
+        for t in uniq:
+            q = _thumb_frame_quality(filepath, t)
+            if q is None:
+                continue
+            mean, std = q
+            score = (min(1.0, mean / PREVIEW_BLACK_LEVEL), min(1.0, std / PREVIEW_FLAT_STD), std)
+            if best is None or score > best[0]:
+                best = (score, t)
+            if score[0] >= 1.0 and score[1] >= 1.0:
+                return t
+        return best[1] if best else 1.0
+    except Exception:
+        logger.warning("تعذر اختيار زمن الصورة المصغّرة - سنستخدم الثانية 1")
+        return 1.0
+
+
+def generate_thumbnail(filepath: str, duration: float = 0):
+    """يولّد صورة مصغّرة (thumbnail) عبر ffmpeg: يختار إطارًا غير أسود/مسطّح
+    (pick_thumbnail_time) ثم يستخرجه بـ -ss قبل -i (بحث سريع بدون فك تشفير
+    كل ما قبله). أي فشل يرجّع None والإرسال يكمل بدون صورة."""
     thumb_path = filepath + "_thumb.jpg"
     try:
+        t = pick_thumbnail_time(filepath, duration)
         subprocess.run(
             [
                 "ffmpeg", "-y",
-                "-ss", "1",           # بحث سريع قبل فتح الملف
+                "-ss", f"{t:.2f}",    # بحث سريع قبل فتح الملف
                 "-i", filepath,
                 "-frames:v", "1",
                 "-vf", "scale=320:-1",
@@ -1283,7 +1342,7 @@ def build_preview_menu_text() -> str:
     seconds = preview_settings["seconds"]
     state = "مفعّلة ✅" if preview_settings["enabled"] else "معطّلة ⛔"
     duration_line = (
-        "تلقائية (15–30 ثانية حسب طول الفيديو)" if not seconds else f"{seconds} ثانية"
+        "تلقائية (من 20 ثانية إلى 3 دقائق حسب طول الفيديو)" if not seconds else f"{seconds} ثانية"
     )
     return (
         "🖼️ **المعاينة** — GIF مختصر يلخّص الفيديو من بدايته لنهايته "
@@ -1398,7 +1457,7 @@ async def handle_preview_duration(event):
 async def _set_preview_seconds(event, arg: str) -> bool:
     if arg.lower() in ("تلقائي", "تلقائى", "auto"):
         pending_preview_prompts.pop(event.chat_id, None)
-        await _apply_preview_setting(event, "seconds", 0, "مدة المعاينة: تلقائية (15–30 ثانية حسب طول الفيديو)")
+        await _apply_preview_setting(event, "seconds", 0, "مدة المعاينة: تلقائية (من 20 ثانية إلى 3 دقائق حسب طول الفيديو)")
         return True
     seconds = int(arg)
     if not PREVIEW_MIN_SECONDS <= seconds <= PREVIEW_MAX_SECONDS:
