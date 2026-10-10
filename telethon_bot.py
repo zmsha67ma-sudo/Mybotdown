@@ -81,7 +81,9 @@ import logging
 import os
 import sys
 import re
+import secrets
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -464,7 +466,7 @@ def auto_preview_seconds(duration: float) -> int:
 def plan_preview(duration: float, seconds_setting: int = 0):
     """يخطط مقاطع المعاينة: قائمة (بداية، طول) بالثواني، مرتبة من أول
     الفيديو لآخره وموزّعة بالتساوي. أول مقطع يبدأ من 0، وآخر مقطع ينتهي
-    عند نهاية الفيديو. عدد المقاطع لا يقل عن 4 (ولا يزيد عن 12).
+    عند نهاية الفيديو. عدد المقاطع لا يقل عن 4 (ولا يزيد عن 24).
     لو الفيديو أقصر من مدة المعاينة نفسها، تكون المعاينة هي الفيديو كله
     (مقطع واحد). يرجّع None لو المدة مجهولة."""
     if not duration or duration <= 0:
@@ -511,6 +513,14 @@ def pick_preview_download(probe: dict, level: int):
     return f"bestvideo[height<={chosen}]/best[height<={chosen}]/best", relative
 
 
+def _remote_input_opts(path: str) -> list:
+    """خيارات فحص أصغر لمصادر البث (http): ffmpeg بالافتراضي يقرأ عدة ميجا
+    للفحص الأولي عند كل فتح، وهذا يضاعف البيانات المقروءة من تيليجرام."""
+    if isinstance(path, str) and path.startswith("http"):
+        return ["-probesize", "262144", "-analyzeduration", "500000"]
+    return []
+
+
 def _num(value, cast=float, default=0):
     try:
         return cast(value)
@@ -523,7 +533,8 @@ def probe_media(path: str) -> dict:
     try:
         result = subprocess.run(
             [
-                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "ffprobe", "-v", "error", *_remote_input_opts(path),
+                "-select_streams", "v:0",
                 "-show_entries", "stream=width,height:format=duration",
                 "-of", "json", path,
             ],
@@ -581,6 +592,7 @@ def analyze_window(filepath: str, start: float, length: float, cancel_event=None
     out = _run_ffmpeg(
         [
             "ffmpeg", "-hide_banner", "-loglevel", "error",
+            *_remote_input_opts(filepath),
             "-ss", f"{max(0.0, start):.2f}", "-i", filepath,
             "-t", f"{length:.2f}", "-an", "-sn",
             "-vf", f"fps={PREVIEW_PROBE_FPS},scale={side}:{side}:flags=area,format=gray",
@@ -706,6 +718,8 @@ def make_preview(
     scale_override=None,
     cancel_event=None,
     progress=None,
+    work_dir=None,
+    smart=None,
 ):
     """يبني المعاينة: يرمّز كل مقطع بنفسه (بحث سريع -ss قبل -i، ومقطع واحد
     بالمرة = ذاكرة قليلة تناسب Render المجاني) ثم يلصقها بالترتيب بدون
@@ -718,7 +732,8 @@ def make_preview(
         raise RuntimeError("ما قدرت أعرف مدة الفيديو لتجهيز المعاينة")
 
     # اختيار ذكي: تجنّب اللقطات السوداء/الثابتة/المكررة (فشله لا يمنع المعاينة)
-    smart_on = PREVIEW_SMART_PICK and len(segments) > 1
+    smart_allowed = PREVIEW_SMART_PICK if smart is None else smart
+    smart_on = smart_allowed and len(segments) > 1
     analysis_steps = len(segments) if smart_on else 0
     total_steps = analysis_steps + len(segments)
     adjusted = 0
@@ -746,7 +761,8 @@ def make_preview(
         f"scale=w='trunc(iw*{factor:.4f}/2)*2':h='trunc(ih*{factor:.4f}/2)*2',"
         "setsar=1"
     )
-    work_dir = os.path.dirname(os.path.abspath(filepath))
+    # filepath ممكن يكون رابط بث محلي (http://127.0.0.1...) فنحتاج مجلد عمل صريح
+    work_dir = work_dir or os.path.dirname(os.path.abspath(filepath))
     seg_paths = [os.path.join(work_dir, f"_pv_{i}.mp4") for i in range(len(segments))]
     out_path = os.path.join(work_dir, "_preview.mp4")
     list_path = os.path.join(work_dir, "_pv_list.txt")
@@ -756,6 +772,7 @@ def make_preview(
             _run_ffmpeg(
                 [
                     "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    *_remote_input_opts(filepath),
                     "-ss", f"{start:.2f}", "-i", filepath,
                     "-t", f"{length:.2f}", "-an", "-vf", vf,
                     "-c:v", "libx264", "-preset", "veryfast",
@@ -1201,6 +1218,189 @@ async def safe_respond(event, text: str = ""):
         return None
 
 
+# ===================== معاينة بدون تنزيل كامل (بث بالأجزاء) =====================
+# بدل ما ننزّل الفيديو المرسل كاملًا من تيليجرام لسيرفر Render ثم نقص منه
+# المعاينة، نشغّل سيرفر HTTP محلي صغير (127.0.0.1 فقط، غير مكشوف للخارج)
+# يمرّر لـ ffmpeg الفيديو على شكل أجزاء عند الطلب (HTTP Range) عبر
+# client.iter_download. ffmpeg يقفز لمواضع المقاطع ويقرأ منها فقط، فنوفّر
+# الوقت والبيانات (خصوصًا بالفيديوهات الطويلة). لو فشل البث لأي سبب نرجع
+# تلقائيًا للتنزيل الكامل.
+PREVIEW_STREAM = os.environ.get("PREVIEW_STREAM", "1").strip().lower() not in (
+    "0", "false", "no", "off", "لا",
+)
+# الملفات الأصغر من هذا الحد (ميجا) تُنزَّل كاملة (أسرع وأبسط من البث)
+PREVIEW_STREAM_MIN_MB = _env_int("PREVIEW_STREAM_MIN_MB", 50, 0)
+# الاختيار الذكي يحلّل نوافذ كثيرة (كل نافذة تقرأ بيانات)، فمع البث يكون
+# معطّلًا افتراضيًا لتوفير القراءة. فعّله بـ PREVIEW_STREAM_SMART=1
+PREVIEW_STREAM_SMART = os.environ.get("PREVIEW_STREAM_SMART", "0").strip().lower() in (
+    "1", "true", "yes", "on", "نعم",
+)
+STREAM_REQUEST_SIZE = 256 * 1024  # يقبل القسمة على 4096 (شرط تيليجرام)
+# ffmpeg يفتح الرابط من جديد لكل مقطع ويعيد قراءة ترويسة الملف (بداية الملف،
+# أو نهايته لو فهرس moov بالآخر) - نخزّنها بالذاكرة (أول/آخر ميجا فقط)
+STREAM_CACHE_EDGE = 1024 * 1024
+stream_sources: dict = {}  # token -> {"doc", "size", "mime", "fetched"}
+STREAM_PORT = None
+_stream_server = None
+
+
+def register_stream_source(doc) -> str:
+    """يسجّل ملف تيليجرام (Document) للبث المحلي ويرجّع رمزًا عشوائيًا."""
+    token = secrets.token_urlsafe(16)
+    stream_sources[token] = {
+        "doc": doc,
+        "size": int(doc.size),
+        "mime": getattr(doc, "mime_type", None) or "video/mp4",
+        "fetched": 0,
+        "cache": {},
+    }
+    return token
+
+
+def parse_http_range(value, size: int):
+    """يحلّل ترويسة Range. يرجّع (بداية، نهاية) شاملة، أو None لو غير صالح.
+    بدون ترويسة → الملف كله."""
+    if not value:
+        return 0, size - 1
+    m = re.match(r"(?i)^\s*bytes=(\d*)-(\d*)\s*$", value)
+    if not m or (not m.group(1) and not m.group(2)):
+        return None
+    if m.group(1):
+        start = int(m.group(1))
+        end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+    else:  # bytes=-N → آخر N بايت
+        start = max(0, size - int(m.group(2)))
+        end = size - 1
+    if start >= size or start > end:
+        return None
+    return start, end
+
+
+async def _iter_source(src, offset: int):
+    """يعطي أجزاء الملف ابتداءً من offset (محاذي لحجم الطلب): أول/آخر ميجا من
+    الكاش لو موجود، والباقي من تيليجرام. src["fetched"] يعدّ فقط ما نزل فعليًا."""
+    size, cache = src["size"], src["cache"]
+    while offset < size and offset in cache:
+        chunk = cache[offset]
+        offset += len(chunk)
+        yield chunk
+    if offset >= size:
+        return
+    it = client.iter_download(
+        src["doc"], offset=offset, request_size=STREAM_REQUEST_SIZE, file_size=size
+    )
+    try:
+        async for chunk in it:
+            if offset < STREAM_CACHE_EDGE or offset + len(chunk) > size - STREAM_CACHE_EDGE:
+                cache[offset] = chunk
+            offset += len(chunk)
+            src["fetched"] += len(chunk)
+            yield chunk
+    finally:
+        try:
+            await it.close()
+        except Exception:
+            pass
+
+
+async def _stream_handle(reader, writer):
+    """يخدم طلب GET/HEAD واحد لملف تيليجرام مسجّل، مع دعم Range."""
+    async def reply(status_line: str, extra: str = ""):
+        writer.write(
+            f"HTTP/1.1 {status_line}\r\n{extra}Connection: close\r\n\r\n".encode("latin-1")
+        )
+        await writer.drain()
+
+    try:
+        request_line = await asyncio.wait_for(reader.readline(), 15)
+        parts = request_line.decode("latin-1").split()
+        if len(parts) < 2:
+            return
+        method, path = parts[0].upper(), parts[1]
+        headers = {}
+        while True:
+            line = await asyncio.wait_for(reader.readline(), 15)
+            if line in (b"\r\n", b"\n", b""):
+                break
+            key, _, val = line.decode("latin-1").partition(":")
+            headers[key.strip().lower()] = val.strip()
+
+        src = None
+        if path.startswith("/tg/") and method in ("GET", "HEAD"):
+            src = stream_sources.get(path[4:].split("?")[0])
+        if src is None:
+            await reply("404 Not Found", "Content-Length: 0\r\n")
+            return
+
+        size = src["size"]
+        rng = parse_http_range(headers.get("range"), size)
+        if rng is None:
+            await reply("416 Range Not Satisfiable",
+                        f"Content-Range: bytes */{size}\r\nContent-Length: 0\r\n")
+            return
+        start, end = rng
+        partial = "range" in headers
+        head = (
+            f"Content-Type: {src['mime']}\r\nAccept-Ranges: bytes\r\n"
+            f"Content-Length: {end - start + 1}\r\n"
+        )
+        if partial:
+            head += f"Content-Range: bytes {start}-{end}/{size}\r\n"
+        await reply("206 Partial Content" if partial else "200 OK", head)
+        if method == "HEAD":
+            return
+
+        # نقلّل القراءة المسبقة: لو المخازن (buffers) كبيرة نسحب من تيليجرام
+        # ميجابايتات قبل ما ffmpeg يطلبها، وغالبًا يقفز بعدها لمقطع ثاني
+        # ويرميها. نحدّد مخزن الإرسال ومخزن الكتابة بحجم صغير.
+        try:
+            sock = writer.get_extra_info("socket")
+            if sock is not None:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 32 * 1024)
+            writer.transport.set_write_buffer_limits(high=32 * 1024, low=8 * 1024)
+        except Exception:
+            pass
+
+        # تيليجرام يشترط أن يكون offset من مضاعفات حجم الطلب - نبدأ من أقرب
+        # حد سابق ونتجاوز البايتات الزايدة بأول جزء
+        aligned = start - (start % STREAM_REQUEST_SIZE)
+        skip = start - aligned
+        remaining = end - start + 1
+        it = _iter_source(src, aligned)
+        try:
+            async for chunk in it:
+                if skip:
+                    chunk, skip = chunk[skip:], 0
+                if len(chunk) > remaining:
+                    chunk = chunk[:remaining]
+                writer.write(chunk)
+                await writer.drain()
+                remaining -= len(chunk)
+                if remaining <= 0:
+                    break
+        finally:
+            await it.aclose()
+    except (ConnectionError, asyncio.TimeoutError):
+        pass  # ffmpeg قطع الاتصال (طبيعي: قفز لموضع ثاني أو انتهى)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("خطأ ببث الفيديو المحلي للمعاينة")
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+
+async def start_stream_server():
+    """يشغّل سيرفر البث المحلي على 127.0.0.1 ومنفذ عشوائي حر."""
+    global STREAM_PORT, _stream_server
+    _stream_server = await asyncio.start_server(_stream_handle, "127.0.0.1", 0)
+    STREAM_PORT = _stream_server.sockets[0].getsockname()[1]
+    logger.info(f"سيرفر بث المعاينة المحلي يعمل على 127.0.0.1:{STREAM_PORT}")
+
+
 # ===================== المعاينة: الحفظ الدائم والإرسال والأوامر =====================
 def _preview_store_text() -> str:
     return (
@@ -1288,6 +1488,9 @@ async def build_and_send_preview(
     duration_hint: float = 0,
     scale_override=None,
     reply_to=None,
+    work_dir=None,
+    smart=None,
+    stream_token=None,
 ):
     """يبني المعاينة من الملف ويرسلها (كـ GIF متحرك) للمحادثة. يرفع
     RuntimeError(CANCELLED_MARKER) لو ألغى المستخدم."""
@@ -1307,6 +1510,8 @@ async def build_and_send_preview(
         scale_override,
         cancel_event,
         on_progress,
+        work_dir,
+        smart,
     )
     thumb_path = await asyncio.to_thread(generate_thumbnail, result["path"])
     head = f"🖼️ معاينة — {title[:200]}" if title else "🖼️ معاينة"
@@ -1314,6 +1519,12 @@ async def build_and_send_preview(
         f"{head}\n🎬 {result['segments']} مقاطع · ⏱️ {int(round(result['duration']))} ثانية"
         f" · 📐 {result['width']}x{result['height']} · 📦 {format_size(result['size'])}"
     )
+    if stream_token and stream_token in stream_sources:
+        s = stream_sources[stream_token]
+        caption += (
+            f"\n📥 قُرئ من تيليجرام {format_size(s['fetched'])} من "
+            f"{format_size(s['size'])} (بدون تنزيل كامل)"
+        )
     operation["stage"] = "uploading"
     await send_bot_file(
         chat_id,
@@ -1528,12 +1739,19 @@ async def handle_uploaded_preview(event):
     if (event.chat_id, msg.id) in bot_sent_ids:
         return
 
-    if doc.size and doc.size > PREVIEW_MAX_INPUT_MB * 1024 * 1024:
-        await safe_respond(
-            event,
-            f"⚠️ الفيديو أكبر من {PREVIEW_MAX_INPUT_MB} ميجا، تعذر عمل معاينة له "
-            "(تغيّره بمتغير PREVIEW_MAX_INPUT_MB).",
-        )
+    # مع البث بالأجزاء ما ننزّل الفيديو كاملًا، فحد الحجم ما يسري عليه؛
+    # الحد (PREVIEW_MAX_INPUT_MB) يخص فقط حالة التنزيل الكامل.
+    stream_ok = bool(
+        PREVIEW_STREAM and STREAM_PORT and doc.size
+        and doc.size >= PREVIEW_STREAM_MIN_MB * 1024 * 1024
+    )
+    too_big_msg = (
+        f"⚠️ حجم الفيديو {format_size(doc.size)} أكبر من الحد {PREVIEW_MAX_INPUT_MB} ميجا "
+        "للتنزيل الكامل، وتعذر استخدام البث بالأجزاء. "
+        "(الحد يتغيّر بمتغير PREVIEW_MAX_INPUT_MB)"
+    )
+    if not stream_ok and doc.size and doc.size > PREVIEW_MAX_INPUT_MB * 1024 * 1024:
+        await safe_respond(event, too_big_msg)
         return
 
     vattr = next(
@@ -1564,16 +1782,46 @@ async def handle_uploaded_preview(event):
     try:
         await acquire_job_slot(status, "فيديو مرسل ← معاينة", cancel_event)
         slot_held = True
-        operation["stage"] = "downloading"
-        src_path = await client.download_media(
-            msg, file=tmp_dir, progress_callback=download_progress
-        )
-        if not src_path or not os.path.exists(src_path):
-            raise FileNotFoundError("تعذر تنزيل الفيديو")
-        await build_and_send_preview(
-            event.chat_id, src_path, "", operation, cancel_event,
-            duration_hint=duration, reply_to=msg.id,
-        )
+
+        # الأفضل: بث بالأجزاء - ffmpeg يقرأ من تيليجرام المقاطع المطلوبة فقط
+        # بدون تنزيل الفيديو كاملًا. لو فشل (أو الملف صغير) → تنزيل كامل.
+        preview_sent = False
+        if stream_ok:
+            token = register_stream_source(doc)
+            operation["stage"] = "converting"
+            try:
+                await build_and_send_preview(
+                    event.chat_id,
+                    f"http://127.0.0.1:{STREAM_PORT}/tg/{token}",
+                    "", operation, cancel_event,
+                    duration_hint=duration, reply_to=msg.id,
+                    work_dir=tmp_dir, smart=PREVIEW_STREAM_SMART,
+                    stream_token=token,
+                )
+                preview_sent = True
+            except Exception as e:
+                if str(e) == CANCELLED_MARKER:
+                    raise
+                logger.warning(f"فشل البث بالأجزاء للمعاينة - نرجع للتنزيل الكامل: {str(e)[:150]}")
+            finally:
+                stream_sources.pop(token, None)
+
+        if not preview_sent:
+            if doc.size and doc.size > PREVIEW_MAX_INPUT_MB * 1024 * 1024:
+                record_finished(operation, "failed", "أكبر من حد التنزيل الكامل")
+                await safe_edit(status, too_big_msg)
+                return
+            operation["stage"] = "downloading"
+            operation["percent"] = 0.0
+            src_path = await client.download_media(
+                msg, file=tmp_dir, progress_callback=download_progress
+            )
+            if not src_path or not os.path.exists(src_path):
+                raise FileNotFoundError("تعذر تنزيل الفيديو")
+            await build_and_send_preview(
+                event.chat_id, src_path, "", operation, cancel_event,
+                duration_hint=duration, reply_to=msg.id,
+            )
         stats["completed_downloads"] += 1
         record_finished(operation, "done")
         if status is not None:
@@ -1581,6 +1829,11 @@ async def handle_uploaded_preview(event):
                 await status.delete()
             except FloodWaitError:
                 pass
+    except RecursionError:
+        stats["failed_downloads"] += 1
+        logger.exception("RecursionError أثناء تجهيز معاينة فيديو مرسل")
+        record_finished(operation, "failed", "تكرار/إعادة توجيهات غير طبيعي")
+        await safe_edit(status, "❌ حدث خطأ داخلي غير متوقع أثناء تجهيز المعاينة.")
     except RuntimeError as e:
         if str(e) == CANCELLED_MARKER:
             record_finished(operation, "cancelled")
@@ -1919,9 +2172,14 @@ def build_settings_text() -> str:
         f"المدة: {'تلقائية' if not preview_settings['seconds'] else str(preview_settings['seconds']) + ' ثانية'} "
         "(تتغيّر بالأوامر وتُحفظ دائمًا، مو من Render)\n"
         f"• `PREVIEW_MAX_SIDE` = {PREVIEW_MAX_SIDE} - أقصى طول للضلع الأطول بالمعاينة\n"
-        f"• `PREVIEW_MAX_INPUT_MB` = {PREVIEW_MAX_INPUT_MB} - أقصى حجم لفيديو مرسل تُصنع له معاينة\n"
+        f"• `PREVIEW_MAX_INPUT_MB` = {PREVIEW_MAX_INPUT_MB} - أقصى حجم لفيديو مرسل تُصنع له معاينة بالتنزيل الكامل (البث بالأجزاء ما يتأثر به)\n"
         f"• `PREVIEW_SMART_PICK` = {'مفعّل ✅' if PREVIEW_SMART_PICK else 'معطّل ⛔'} - "
-        "تجنّب اللقطات السوداء/الثابتة/المكررة بالمعاينة\n\n"
+        "تجنّب اللقطات السوداء/الثابتة/المكررة بالمعاينة\n"
+        f"• `PREVIEW_STREAM` = {'مفعّل ✅' if PREVIEW_STREAM else 'معطّل ⛔'} - "
+        "معاينة الفيديو المرسل بدون تنزيله كاملًا (بث بالأجزاء)\n"
+        f"• `PREVIEW_STREAM_MIN_MB` = {PREVIEW_STREAM_MIN_MB} - الملفات الأصغر تُنزَّل كاملة\n"
+        f"• `PREVIEW_STREAM_SMART` = {'مفعّل ✅' if PREVIEW_STREAM_SMART else 'معطّل ⛔'} - "
+        "الاختيار الذكي مع البث (يقرأ بيانات أكثر)\n\n"
         "**الأمان والمجموعة:**\n"
         f"• `GROUP_CHAT_ID` = {group_line} - "
         "المجموعة الخاصة لأرقامك الثانية\n"
@@ -2875,6 +3133,8 @@ async def main():
         )
 
     await start_health_server()
+    if PREVIEW_STREAM:
+        await start_stream_server()
     await client.start()
     global SELF_ENTITY
     SELF_ENTITY = await client.get_me()
