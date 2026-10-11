@@ -433,7 +433,12 @@ PREVIEW_LEVELS = {
 }
 # الإعدادات الحالية (تُحمَّل من الرسالة المحفوظة وقت التشغيل)
 # translate = ترجمة تلقائية لكل فيديو (رابط أو مرسل) بدون كتابة كلمة ترجمة (أمر تفعيل الترجمة)
-preview_settings = {"enabled": False, "level": 3, "seconds": 0, "translate": False}  # seconds=0 → تلقائي
+preview_settings = {
+    "enabled": False, "level": 3, "seconds": 0, "translate": False,  # seconds=0 → تلقائي
+    # شكل الترجمة المدموجة: حجم الخط % من الضلع القصير، عدد الألوان، لون الطرف الأول/الثاني، الخط
+    "sub_size": translator.FONT_PERCENT, "sub_colors": 2,
+    "sub_c1": "FFFFFF", "sub_c2": "FFD400", "sub_font": "",
+}
 preview_store_msg_id = None
 PREVIEW_STORE_TAG = "#preview_settings"
 # سؤال دقة/مدة مفتوح بانتظار ردك: chat_id -> {"kind": "level"|"seconds", "expires": ...}
@@ -461,6 +466,24 @@ def sanitize_preview_settings(data) -> dict:
             out["seconds"] = seconds
     except (TypeError, ValueError):
         pass
+    try:
+        size = int(data.get("sub_size", out["sub_size"]))
+        if 1 <= size <= 100:
+            out["sub_size"] = size
+    except (TypeError, ValueError):
+        pass
+    try:
+        if int(data.get("sub_colors", out["sub_colors"])) in (1, 2):
+            out["sub_colors"] = int(data.get("sub_colors", out["sub_colors"]))
+    except (TypeError, ValueError):
+        pass
+    for key in ("sub_c1", "sub_c2"):
+        hx = translator.parse_color(str(data.get(key) or ""))
+        if hx:
+            out[key] = hx
+    font = data.get("sub_font")
+    if isinstance(font, str) and len(font) <= 80:
+        out["sub_font"] = font.strip()
     return out
 
 
@@ -1717,6 +1740,21 @@ async def handle_preview_reply(event):
     if future is not None and not future.done():
         return
     text = (event.raw_text or "").strip()
+    if pending["kind"] == "font":
+        fonts = pending.get("fonts") or []
+        if text.isdigit() and 1 <= int(text) <= len(fonts):
+            pending_preview_prompts.pop(chat_id, None)
+            await _choose_font(event, fonts[int(text) - 1])
+        else:
+            await safe_respond(event, f"❌ رد برقم من 1 إلى {len(fonts)}.")
+        return
+    if pending["kind"] == "fontsize":
+        if text.isdigit() and 1 <= int(text) <= 100:
+            pending_preview_prompts.pop(chat_id, None)
+            await _set_sub_size(event, int(text))
+        else:
+            await safe_respond(event, "❌ رد برقم من 1 إلى 100.")
+        return
     if pending["kind"] == "level":
         if text.isdigit() and int(text) in PREVIEW_LEVELS:
             pending_preview_prompts.pop(chat_id, None)
@@ -1900,7 +1938,7 @@ async def run_translation_job(
         result = await translator.translate_video(
             src_path, work_dir, title or "video", cancel_event=cancel_event,
             on_progress=on_progress, burn=burn, burn_height=burn_height,
-            duration_hint=duration,
+            duration_hint=duration, style=current_sub_style(),
         )
     except translator.TranslateError as e:
         raise UserFacingError(str(e))
@@ -2090,6 +2128,306 @@ async def translate_video_message(event, source_msg):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+# ======================================================================
+# شكل الترجمة المدموجة: حجم الخط، الألوان، نوع الخط، خطوط جديدة
+# ======================================================================
+FONTS_DIR = translator.FONTS_DIR
+FONT_TAG = "#tr_font"
+FONT_FILE_EXTS = (".ttf", ".otf")
+custom_fonts: dict = {}      # اسم عائلة الخط -> مسار الملف (يُسترجع من Saved Messages عند التشغيل)
+pending_new_font: dict = {}  # chat_id -> وقت انتهاء انتظار ملف خط
+FONT_PAGE = 12               # عدد الخطوط بكل صورة معاينة
+try:
+    os.makedirs(FONTS_DIR, exist_ok=True)
+except OSError:
+    logger.warning("تعذر إنشاء مجلد الخطوط المخصصة")
+
+
+def current_sub_style() -> dict:
+    return {
+        "size": preview_settings["sub_size"], "colors": preview_settings["sub_colors"],
+        "c1": preview_settings["sub_c1"], "c2": preview_settings["sub_c2"],
+        "font": preview_settings["sub_font"], "fonts_dir": FONTS_DIR,
+    }
+
+
+def available_fonts() -> list:
+    """الخطوط الجاهزة المثبّتة بالسيرفر ثم الخطوط اللي أضفتها أنت."""
+    fonts = list(translator.builtin_fonts())
+    for fam in sorted(custom_fonts):
+        if fam not in fonts:
+            fonts.append(fam)
+    return fonts
+
+
+def sub_style_summary() -> str:
+    p = preview_settings
+    colors = (
+        f"لون واحد ({translator.color_name(p['sub_c1'])})" if p["sub_colors"] == 1
+        else f"لونان: الطرف الأول {translator.color_name(p['sub_c1'])}، "
+             f"الطرف الثاني {translator.color_name(p['sub_c2'])}"
+    )
+    return (
+        f"• حجم الخط: {p['sub_size']}%\n• الألوان: {colors}\n"
+        f"• نوع الخط: {p['sub_font'] or translator.FONT_NAME}"
+    )
+
+
+async def load_custom_fonts():
+    """وقت التشغيل: يسترجع الخطوط اللي أضفتها (محفوظة كملفات برسائل #tr_font بـ Saved
+    Messages لأن Render المجاني يمسح ملفات السيرفر مع كل إعادة تشغيل)."""
+    try:
+        found = []
+        async for m in client.iter_messages("me", search=FONT_TAG, limit=100):
+            found.append(m)
+        if not found:
+            async for m in client.iter_messages("me", limit=300):
+                if m.document is not None and FONT_TAG in (m.raw_text or ""):
+                    found.append(m)
+        for m in found:
+            if not m.out or m.document is None or FONT_TAG not in (m.raw_text or ""):
+                continue
+            name = getattr(getattr(m, "file", None), "name", None) or f"font_{m.id}.ttf"
+            path = os.path.join(FONTS_DIR, f"{m.id}_{re.sub(r'[^A-Za-z0-9._-]', '_', name)}")
+            if not os.path.exists(path):
+                await client.download_media(m, file=path)
+            fam = await asyncio.to_thread(translator.font_family_name, path)
+            if fam:
+                custom_fonts[fam] = path
+        logger.info(f"الخطوط المخصصة المحمّلة: {sorted(custom_fonts)}")
+    except Exception:
+        logger.exception("تعذر تحميل الخطوط المخصصة المحفوظة")
+
+
+async def _apply_many(event, updates: dict, label: str):
+    preview_settings.update(updates)
+    saved = await save_preview_settings()
+    note = "محفوظ بشكل دائم" if saved else "⚠️ طُبّق لكن تعذر الحفظ الدائم"
+    await safe_respond(event, f"✅ {label}\n({note})")
+
+
+async def _set_sub_size(event, size: int):
+    await _apply_many(event, {"sub_size": size}, f"حجم الخط: {size}% من الضلع القصير للفيديو")
+
+
+async def _choose_font(event, family: str):
+    await _apply_many(event, {"sub_font": family}, f"نوع الخط: {family}")
+
+
+def _color_help() -> str:
+    names = " · ".join(n for n, _ in translator.COLOR_CHOICES)
+    return f"الألوان المتاحة: {names}\n(أو كود hex مثل `#FF9900`، أو اسم إنجليزي مثل `orange`)"
+
+
+@client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=r"(?i)^حجم\s+(?:ال)?خط(?:\s+(\d{1,3}))?$"))
+async def handle_font_size(event):
+    if not is_allowed_trigger(event):
+        return
+    arg = event.pattern_match.group(1)
+    if arg is None:
+        pending_preview_prompts[event.chat_id] = {
+            "kind": "fontsize", "expires": time.monotonic() + PREVIEW_PROMPT_TTL,
+        }
+        await safe_respond(
+            event,
+            f"🔠 أرسل حجم الخط من 1 إلى 100 (نسبة % من الضلع القصير للفيديو).\n"
+            f"(الحالي: {preview_settings['sub_size']}، الافتراضي 14)",
+        )
+        return
+    size = int(arg)
+    if not 1 <= size <= 100:
+        await safe_respond(event, "❌ حجم الخط لازم يكون من 1 إلى 100.")
+        return
+    pending_preview_prompts.pop(event.chat_id, None)
+    await _set_sub_size(event, size)
+
+
+@client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=r"(?i)^عدد\s+(?:ال)?[اأ]لوان(?:\s+(.+))?$"))
+async def handle_color_count(event):
+    if not is_allowed_trigger(event):
+        return
+    arg = _norm_cmd(event.pattern_match.group(1) or "")
+    if not arg:
+        await safe_respond(
+            event,
+            f"🎨 عدد الألوان الحالي: {preview_settings['sub_colors']}\n"
+            "• `عدد الالوان 1` → الترجمة كلها بلون واحد\n"
+            "• `عدد الالوان 2` → لون لكل طرف (الأول فوق، والثاني تحته لو قاطعه)",
+        )
+        return
+    if re.search(r"(^|\s)(1|واحد|لون واحد)(\s|$)", arg):
+        n = 1
+    elif re.search(r"(^|\s)(2|لونين|لونان|اثنين|اثنان)(\s|$)", arg):
+        n = 2
+    else:
+        await safe_respond(event, "❌ اكتب `عدد الالوان 1` أو `عدد الالوان 2`.")
+        return
+    await _apply_many(
+        event, {"sub_colors": n},
+        "الترجمة بلون واحد" if n == 1 else "الترجمة بلونين (لون لكل طرف)",
+    )
+
+
+def _norm_cmd(text: str) -> str:
+    return translator._norm_ar(text)
+
+
+@client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=r"(?i)^لون\s+(?:ال)?خط(?:\s+(.+))?$"))
+async def handle_font_color(event):
+    """`لون الخط` (قائمة) | `لون الخط أصفر` (الطرف الأول) | `لون الخط أبيض أصفر` (الأول والثاني)."""
+    if not is_allowed_trigger(event):
+        return
+    arg = (event.pattern_match.group(1) or "").strip()
+    if not arg:
+        p = preview_settings
+        await safe_respond(
+            event,
+            "🎨 **لون الخط**\n"
+            f"• الطرف الأول: {translator.color_name(p['sub_c1'])}\n"
+            f"• الطرف الثاني: {translator.color_name(p['sub_c2'])}\n"
+            f"• عدد الألوان: {p['sub_colors']}\n\n"
+            "• `لون الخط أصفر` → لون الطرف الأول\n"
+            "• `لون الخط أبيض أصفر` → الأول ثم الثاني\n"
+            "• `لون الطرف الاول أبيض` / `لون الطرف الثاني برتقالي`\n\n" + _color_help(),
+        )
+        return
+    tokens = arg.split()
+    colors = [translator.parse_color(t) for t in tokens[:2]]
+    if not colors or any(c is None for c in colors):
+        await safe_respond(event, "❌ لون غير معروف.\n" + _color_help())
+        return
+    updates = {"sub_c1": colors[0]}
+    label = f"لون الطرف الأول: {translator.color_name(colors[0])}"
+    if len(colors) == 2:
+        updates["sub_c2"] = colors[1]
+        label += f" · الطرف الثاني: {translator.color_name(colors[1])}"
+    await _apply_many(event, updates, label)
+
+
+@client.on(events.NewMessage(
+    chats=ALLOWED_CHATS,
+    pattern=r"(?i)^لون\s+(?:ال)?طرف\s+(?:ال)?(اول|أول|ثاني|ثانى|1|2)\s+(.+)$"))
+async def handle_party_color(event):
+    if not is_allowed_trigger(event):
+        return
+    which = _norm_cmd(event.pattern_match.group(1))
+    hx = translator.parse_color(event.pattern_match.group(2))
+    if not hx:
+        await safe_respond(event, "❌ لون غير معروف.\n" + _color_help())
+        return
+    first = which in ("اول", "1")
+    await _apply_many(
+        event, {"sub_c1" if first else "sub_c2": hx},
+        f"لون الطرف {'الأول' if first else 'الثاني'}: {translator.color_name(hx)}",
+    )
+
+
+@client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=r"(?i)^نوع\s+(?:ال)?خط(?:\s+(\d{1,2}))?$"))
+async def handle_font_type(event):
+    """`نوع الخط` → صور معاينة الخطوط مرقّمة وترد برقم | `نوع الخط 3` → مباشرة."""
+    if not is_allowed_trigger(event):
+        return
+    fonts = available_fonts()
+    arg = event.pattern_match.group(1)
+    if arg is not None:
+        idx = int(arg)
+        if not 1 <= idx <= len(fonts):
+            await safe_respond(event, f"❌ رقم غير صالح. اختر من 1 إلى {len(fonts)}.")
+            return
+        pending_preview_prompts.pop(event.chat_id, None)
+        await _choose_font(event, fonts[idx - 1])
+        return
+    status = await safe_respond(event, "🔤 جاري تجهيز صورة الخطوط...")
+    try:
+        for start in range(0, len(fonts), FONT_PAGE):
+            page = fonts[start:start + FONT_PAGE]
+            png = os.path.join(tempfile.gettempdir(), f"fonts_{secrets.token_hex(4)}.png")
+            try:
+                await asyncio.to_thread(
+                    translator.render_font_preview, page, png, FONTS_DIR, start + 1
+                )
+                await send_bot_file(event.chat_id, png, caption=f"🔤 الخطوط {start + 1}–{start + len(page)}")
+            finally:
+                try:
+                    os.remove(png)
+                except OSError:
+                    pass
+    except Exception as e:
+        logger.exception("تعذر إنشاء صورة معاينة الخطوط")
+        await safe_edit(status, f"❌ تعذر إنشاء صورة الخطوط: {str(e)[:120]}")
+        return
+    pending_preview_prompts[event.chat_id] = {
+        "kind": "font", "fonts": fonts, "expires": time.monotonic() + 300,
+    }
+    current = preview_settings["sub_font"] or translator.FONT_NAME
+    await safe_edit(
+        status,
+        f"🔤 اختر الخط: رد برقمه (1–{len(fonts)}) خلال 5 دقائق.\n(الحالي: {current})\n"
+        "لإضافة خط من عندك أرسل: `خط جديد` ثم ملف الخط (.ttf أو .otf)",
+    )
+
+
+@client.on(events.NewMessage(chats=ALLOWED_CHATS, pattern=r"(?i)^(?:خط\s+جديد|[اإ]ضاف[ةه]\s+خط(?:\s+جديد)?)$"))
+async def handle_new_font_cmd(event):
+    if not is_allowed_trigger(event):
+        return
+    pending_new_font[event.chat_id] = time.monotonic() + 300
+    await safe_respond(
+        event,
+        "📎 أرسل الآن ملف الخط (.ttf أو .otf) وأعتمده وأستخدمه مباشرة.\n"
+        "(يبقى محفوظًا دائمًا، وتقدر تختار بينه وبين الخطوط الجاهزة بـ `نوع الخط`)",
+    )
+
+
+@client.on(events.NewMessage(chats=ALLOWED_CHATS))
+async def handle_font_file(event):
+    """ملف خط (.ttf/.otf) مرسل بعد `خط جديد`، أو بوصفه `خط جديد`."""
+    if not is_allowed_trigger(event):
+        return
+    msg = event.message
+    doc = msg.document
+    if doc is None:
+        return
+    name = getattr(getattr(msg, "file", None), "name", None) or ""
+    if not name.lower().endswith(FONT_FILE_EXTS):
+        return
+    waiting = pending_new_font.get(event.chat_id, 0) > time.monotonic()
+    caption = (event.raw_text or "").strip()
+    if not waiting and not re.fullmatch(r"(?i)خط\s+جديد", caption):
+        return
+    if FONT_TAG in caption or (event.chat_id, msg.id) in bot_sent_ids:
+        return
+    pending_new_font.pop(event.chat_id, None)
+    if doc.size and doc.size > 25 * 1024 * 1024:
+        await safe_respond(event, "⚠️ ملف الخط كبير جدًا (الحد 25 ميجا).")
+        return
+    status = await safe_respond(event, "🔤 جاري اعتماد الخط...")
+    try:
+        os.makedirs(FONTS_DIR, exist_ok=True)
+        safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+        path = os.path.join(FONTS_DIR, f"{msg.id}_{safe_name}")
+        await client.download_media(msg, file=path)
+        family = await asyncio.to_thread(translator.font_family_name, path)
+        if not family:
+            os.remove(path)
+            await safe_edit(status, "❌ ما قدرت أقرأ هذا الملف كخط صالح (TTF/OTF).")
+            return
+        custom_fonts[family] = path
+        # نسخة دائمة بـ Saved Messages ترجع بعد أي إعادة تشغيل
+        await send_bot_file("me", path, caption=f"{FONT_TAG} {family}", force_document=True)
+        preview_settings["sub_font"] = family
+        saved = await save_preview_settings()
+        await safe_edit(
+            status,
+            f"✅ تم اعتماد الخط **{family}** واستخدامه للترجمة.\n"
+            + ("(محفوظ بشكل دائم)" if saved else "⚠️ تعذر الحفظ الدائم للإعداد")
+            + "\nللتبديل بين الخطوط: `نوع الخط`",
+        )
+    except Exception as e:
+        logger.exception("فشل اعتماد الخط الجديد")
+        await safe_edit(status, f"❌ تعذر اعتماد الخط: {str(e)[:120]}")
+
+
 def build_translate_menu_text() -> str:
     on = bool(preview_settings.get("translate"))
     state = "مفعّلة ✅" if on else "معطّلة ⛔"
@@ -2104,6 +2442,11 @@ def build_translate_menu_text() -> str:
         "• `تعطيل الترجمة` → إيقاف الترجمة التلقائية\n"
         "• `الرابط ترجمة` / رد بكلمة `ترجمة` على فيديو / فيديو ووصفه `ترجمة` → "
         "ترجمة لمرة وحدة، تشتغل دائمًا حتى لو الميزة معطّلة\n\n"
+        "**شكل الترجمة** (محفوظ بشكل دائم):\n"
+        + sub_style_summary() + "\n"
+        "• `حجم الخط 14` (1–100) · `عدد الالوان 1` أو `2`\n"
+        "• `لون الخط` (الألوان) · `لون الطرف الاول أبيض` · `لون الطرف الثاني أصفر`\n"
+        "• `نوع الخط` (صورة معاينة وترد برقم) · `خط جديد` (ترسل ملف .ttf/.otf)\n\n"
         "**ملاحظات:**\n"
         "• لو الترجمة التلقائية مفعّلة وكتبت مع الرابط `gif` أو `mp3` أو `معاينة` "
         "يتنفذ هذا الأمر بدل الترجمة\n"
@@ -2460,6 +2803,9 @@ def build_help_text() -> str:
         "• `تفعيل الترجمة` → كل رابط أو فيديو ترسله يُترجم تلقائيًا بدون كتابة ترجمة\n"
         "• `تعطيل الترجمة` → رجوع للأوامر العادية (كلمة `ترجمة` تبقى تشتغل لمرة وحدة)\n"
         "• `الترجمة` → حالة الترجمة وأوامرها\n"
+        "• `حجم الخط 14` (من 1 إلى 100) · `عدد الالوان 1` أو `2` (لون لكل طرف)\n"
+        "• `لون الخط` · `لون الطرف الاول أبيض` · `لون الطرف الثاني أصفر`\n"
+        "• `نوع الخط` → صورة فيها الخطوط مرقّمة وترد برقم · `خط جديد` ثم ملف .ttf/.otf\n"
         f"• حتى {translator.MAX_MINUTES} دقيقة للترجمة، ودمجها بالفيديو لغاية "
         f"{translator.BURN_MAX_MINUTES} دقائق (بعدها يرسل ملف SRT فقط)\n"
         "• تحتاج مفتاح مجاني `GROQ_API_KEY` من console.groq.com\n\n"
@@ -2525,7 +2871,7 @@ def build_settings_text() -> str:
         f"• `TRANSLATE_MAX_MINUTES` = {translator.MAX_MINUTES} · "
         f"`TRANSLATE_MAX_INPUT_MB` = {translator.MAX_INPUT_MB}\n"
         f"• `TRANSLATE_BURN` = {'مفعّل ✅' if translator.BURN_DEFAULT else 'معطّل ⛔'} · "
-        f"`TRANSLATE_BURN_HEIGHT` = {translator.BURN_HEIGHT} · "
+        f"`TRANSLATE_BURN_HEIGHT` = {translator.BURN_HEIGHT or 'الأصلية'} · "
         f"`TRANSLATE_BURN_MAX_MINUTES` = {translator.BURN_MAX_MINUTES}\n"
         "• `TRANSLATE_STT_MODEL` / `TRANSLATE_LLM_MODEL` - نماذج التفريغ والترجمة\n\n"
         "**الأمان والمجموعة:**\n"
@@ -3121,8 +3467,11 @@ async def process_single_url(
     elif as_translate:
         # الترجمة: ما نحتاج جودة عالية (الصوت هو المهم، والفيديو المترجم
         # أصلًا يُصغَّر لـ TRANSLATE_BURN_HEIGHT) - نوفّر الباندويدث.
-        cap = quality or translator.BURN_HEIGHT
-        fmt = f"bestvideo[height<={cap}]+bestaudio/best[height<={cap}]/best"
+        cap = quality or translator.BURN_HEIGHT  # 0 = أعلى جودة (دقة الأصل)
+        fmt = (
+            f"bestvideo[height<={cap}]+bestaudio/best[height<={cap}]/best"
+            if cap else "bestvideo+bestaudio/best"
+        )
     elif as_preview:
         # المعاينة فقط: فيديو بدون صوت، والدقة المناسبة تُحدَّد بعد استعلام
         # الجودات داخل try (pick_preview_download) توفيرًا للباندويدث
@@ -3523,6 +3872,7 @@ async def main():
     SELF_ENTITY = await client.get_me()
     is_premium = apply_account_limits(SELF_ENTITY)
     await load_preview_settings()
+    await load_custom_fonts()
     logger.info(
         "ميزة ترجمة الفيديو: "
         + ("جاهزة ✅" if translator.is_configured() else "غير مفعّلة (اضبط GROQ_API_KEY)")

@@ -1,6 +1,6 @@
 FROM python:3.11-slim
-# fonts-noto-core: خط عربي لدمج الترجمة بالفيديو (ffmpeg + libass)
-RUN apt-get update && apt-get install -y ffmpeg git fonts-noto-core && rm -rf /var/lib/apt/lists/*
+# خطوط عربية لدمج الترجمة (ffmpeg + libass) ولقائمة "نوع الخط"؛ fontconfig لقراءة أسماء الخطوط
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg git fontconfig fonts-noto-core fonts-hosny-amiri fonts-sil-scheherazade fonts-sil-lateef fonts-kacst && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
