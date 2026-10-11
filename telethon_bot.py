@@ -994,10 +994,54 @@ pending_quality_options: dict = {}
 bot_sent_ids = collections.deque(maxlen=500)
 
 
-async def send_bot_file(chat_id, *args, **kwargs):
+# أقصى انتظار (ثواني) لـ FloodWait واحد عند إرسال ملف، وعدد مرات إعادة المحاولة.
+# Telethon ينتظر تلقائيًا فقط لو الانتظار ≤ flood_sleep_threshold (60ث)؛ أي انتظار أطول
+# كان يرمي FloodWaitError فيضيع عمل ساعات (مثلًا ترجمة+دمج) والملف ينحذف. الآن ننتظر ونعيد.
+FLOOD_MAX_WAIT = _env_int("FLOOD_MAX_WAIT_SECONDS", 900, 60)
+FLOOD_MAX_RETRIES = 3
+
+
+async def _flood_sleep(seconds: int, status=None, cancel_event=None):
+    """ينتظر seconds ثانية مع تحديث رسالة الحالة كل ~15ث، ويحترم الإلغاء."""
+    end = time.monotonic() + seconds
+    last_edit = 0.0
+    while True:
+        left = end - time.monotonic()
+        if left <= 0:
+            return
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError(CANCELLED_MARKER)
+        if status is not None and time.monotonic() - last_edit >= 15:
+            last_edit = time.monotonic()
+            await safe_edit(
+                status,
+                f"⏳ تيليجرام يطلب انتظار قبل الإرسال (حد إرسال مؤقت). "
+                f"سأرسل تلقائيًا بعد ~{int(left)} ث.\n\n(أرسل \"الغاء\" لإيقاف العملية)",
+            )
+        await asyncio.sleep(min(2.0, left))
+
+
+async def send_bot_file(chat_id, *args, flood_status=None, flood_cancel=None, **kwargs):
     """يرسل ملف عبر client.send_file ويسجّل رقم الرسالة المرسلة، عشان
-    معالج الفيديوهات المرسلة (handle_uploaded_video) يتجاهلها."""
-    msg = await client.send_file(chat_id, *args, **kwargs)
+    معالج الفيديوهات المرسلة (handle_uploaded_video) يتجاهلها.
+    لو تيليجرام رد بـ FloodWait أطول من حد Telethon التلقائي: ننتظر المدة المطلوبة
+    ونعيد الإرسال (حتى FLOOD_MAX_RETRIES مرات وبحد FLOOD_MAX_WAIT ثانية للمرة)،
+    بدل ما نفشل ونضيّع الملف. flood_status/flood_cancel اختياريان (تحديث الحالة + الإلغاء)."""
+    attempt = 0
+    while True:
+        try:
+            msg = await client.send_file(chat_id, *args, **kwargs)
+            break
+        except FloodWaitError as e:
+            attempt += 1
+            wait = int(e.seconds) + 3
+            if attempt > FLOOD_MAX_RETRIES or wait > FLOOD_MAX_WAIT:
+                raise
+            logger.warning(
+                f"FloodWaitError عند إرسال ملف ({e.seconds}s) - انتظار ثم إعادة المحاولة "
+                f"({attempt}/{FLOOD_MAX_RETRIES})"
+            )
+            await _flood_sleep(wait, flood_status, flood_cancel)
     first = msg[0] if isinstance(msg, (list, tuple)) else msg
     bot_sent_ids.append((chat_id, first.id))
     return msg
@@ -1957,7 +2001,7 @@ async def run_translation_job(
         caption += "\nℹ️ استُخدم نموذج ترجمة احتياطي (حصة النموذج الأساسي خلصت)"
     await send_bot_file(
         chat_id, result["srt_path"], caption=caption, force_document=True,
-        reply_to=reply_to,
+        reply_to=reply_to, flood_status=status, flood_cancel=cancel_event,
     )
 
     vpath = result["video_path"]
@@ -1989,6 +2033,7 @@ async def run_translation_job(
                 )],
                 thumb=thumb, supports_streaming=True, reply_to=reply_to,
                 progress_callback=upload_progress,
+                flood_status=status, flood_cancel=cancel_event,
             )
             stats["total_bytes_sent"] += vsize
     if note:
