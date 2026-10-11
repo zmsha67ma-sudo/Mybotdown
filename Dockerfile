@@ -1,6 +1,8 @@
 FROM python:3.11-slim
-# خطوط عربية لدمج الترجمة (ffmpeg + libass) ولقائمة "نوع الخط"؛ fontconfig لقراءة أسماء الخطوط
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg git fontconfig fonts-noto-core fonts-hosny-amiri fonts-sil-scheherazade fonts-sil-lateef fonts-kacst && rm -rf /var/lib/apt/lists/*
+# fonts-noto-core: خط عربي لدمج الترجمة بالفيديو (ffmpeg + libass)؛ fontconfig لقراءة أسماء الخطوط
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg git fontconfig fonts-noto-core && rm -rf /var/lib/apt/lists/*
+# خطوط عربية إضافية لقائمة "نوع الخط" - اختيارية: كل خط يُثبَّت لوحده، وإن لم يوجد بالمستودع يُتخطى بدون ما يفشل البناء
+RUN apt-get update && for p in fonts-hosny-amiri fonts-sil-scheherazade fonts-sil-lateef fonts-kacst fonts-noto-ui-core; do apt-get install -y --no-install-recommends "$p" || echo "تخطي $p"; done; rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
