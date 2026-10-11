@@ -92,6 +92,13 @@ BATCH_SEGMENTS = 25          # جمل لكل طلب ترجمة
 BATCH_CHARS = 3000
 MAX_WAIT_SECONDS = 70        # أقصى انتظار لإعادة محاولة بعد 429
 
+VERSION = "2026-10-11-sync-font-size"
+print(
+    f"[translator] نسخة {VERSION} | preset={BURN_PRESET} crf={BURN_CRF} "
+    f"font={FONT_PERCENT}% offset={SYNC_OFFSET_MS}ms height={BURN_HEIGHT} font_name={FONT_NAME}",
+    flush=True,
+)
+
 SETUP_HINT = (
     "ميزة الترجمة تحتاج مفتاح API مجاني من Groq:\n"
     "1) افتح console.groq.com وسجّل (بدون بطاقة)\n"
@@ -845,6 +852,11 @@ def burn_subtitles(src: str, sub_path: str, out_path: str, height: int, duration
         a_args = ["-c:a", "copy"]
     else:
         a_args = ["-c:a", "aac", "-b:a", "80k"]
+    logger.info(
+        f"دمج الترجمة [{VERSION}]: sub={os.path.splitext(sub_path)[1]} preset={BURN_PRESET} "
+        f"crf={BURN_CRF} video_args={v_args[8:] or '-'} audio={a_args[1]} "
+        f"src_v_bps={v_bps} src_size={os.path.getsize(src) / 1e6:.1f}MB"
+    )
     cmd = (
         ["ffmpeg", "-y", "-v", "error", "-nostats", "-progress", "pipe:1",
          "-i", src, "-map", "0:v:0", "-map", "0:a?", "-vf", vf]
@@ -899,6 +911,9 @@ def burn_subtitles(src: str, sub_path: str, out_path: str, height: int, duration
         pass
     if not os.path.exists(out_path) or os.path.getsize(out_path) < 1024:
         raise TranslateError("الفيديو الناتج بعد الدمج تالف أو فاضي.")
+    logger.info(
+        f"انتهى الدمج: {os.path.getsize(src) / 1e6:.1f}MB ← {os.path.getsize(out_path) / 1e6:.1f}MB"
+    )
 
 
 # ---------------------------------------------------------------- المنسّق
